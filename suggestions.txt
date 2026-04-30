@@ -1,0 +1,16 @@
+To achieve high-end photorealism with your current SDXL models, you should pair them with specific LoRAs (Low-Rank Adaptations) designed to add "grit," skin texture, and realistic lighting.
+Since you are using Juggernaut-XL v9 and RealVisXL V5.0, these are the best hyper-realistic LoRAs currently favored by the community:
+Top Hyper-Realism LoRAs for SDXL
+UltraRealistic Lora V2: This is a top-tier choice for making images indistinguishable from actual or analog photos. It adds a layer of "raw" photography feel that works perfectly with RealVisXL.
+Pony Realism (v2.2): While your models are standard SDXL, using realism-focused refinements like those found in the Pony ecosystem can improve specific details like hands, feet, and refined skin textures.
+Detail Tweaker XL: A "utility" LoRA that allows you to increase or decrease the level of fine detail (pores, fabric weave, etc.) without changing the overall composition of your image.
+Skin & Texture Specialists: Look for "Global Skin" or "Realistic Skin" LoRAs. These are designed to fix the "plastic" look AI sometimes gives and add realistic imperfections.
+Recommended Settings for Maximum Realism
+To get the most out of these models and LoRAs, use these technical settings:
+Sampler: DPM++ 2M Karras is the gold standard for Juggernaut XL to ensure sharp, clean results.
+CFG Scale: Keep this between 3 and 6. Lower CFG scales (closer to 3-4) often produce more realistic, less "over-processed" results.
+Steps: Aim for 30–40 steps for the best balance of detail and performance.
+Resolution: For portraits, use 832 x 1216. For landscape/cinematic, use 1216 x 832.
+Prompting Tip
+Instead of just "photorealistic," try using "editorial film style" or "raw photo" to trigger the model's training on high-quality real-world datasets.
+Would you like a sample prompt structure specifically optimized for RealVisXL and Juggernaut to test your new setup?

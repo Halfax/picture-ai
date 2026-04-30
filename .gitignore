@@ -1,0 +1,44 @@
+# Secrets - HuggingFace tokens, never commit
+token.txt
+config/hf_token.txt
+.env
+.env.local
+
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# Python bytecode
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+
+# Downloaded model weights (huge, regenerable from HF)
+models_cache/
+hf_cache/
+.cache/huggingface/
+
+# Generated images and runtime caches
+image_cache/
+output/
+generated/
+
+# Logs
+logs/
+*.log
+*.log.[0-9]*
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*.bak
+*.tmp
+.DS_Store
+Thumbs.db

@@ -1,0 +1,916 @@
+from __future__ import annotations
+
+import logging
+import os
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Optional
+
+import numpy as np
+from PIL import Image
+
+CallbackType = Optional[Callable[[int, int, object], None]]
+
+# Reference mode constants
+REF_MODE_IMG2IMG = "img2img"
+REF_MODE_FACE = "face"
+REF_MODE_STYLE = "style"
+
+# IP-Adapter configuration
+IP_ADAPTER_REPO = "h94/IP-Adapter"
+IP_ADAPTER_SUBFOLDER = "sdxl_models"
+IP_ADAPTER_WEIGHTS = {
+    REF_MODE_FACE: "ip-adapter-plus-face_sdxl_vit-h.safetensors",
+    REF_MODE_STYLE: "ip-adapter-plus_sdxl_vit-h.safetensors",
+}
+
+
+@dataclass(slots=True)
+class LoRAConfig:
+    source: str
+    weight_name: str | None = None
+    scale: float = 1.0
+
+    def key(self) -> str:
+        return f"{self.source}|{self.weight_name or ''}|{self.scale:.3f}"
+
+
+@dataclass(slots=True)
+class DeviceInfo:
+    kind: str
+    description: str
+    generator_device: str
+
+
+class PipelineManager:
+    """Load and manage Stable Diffusion XL pipelines with caching."""
+
+    def __init__(
+        self,
+        models_root: Path,
+        *,
+        upscale_model_id: str = "stabilityai/stable-diffusion-x4-upscaler",
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self.models_root = models_root
+        self.models_root.mkdir(parents=True, exist_ok=True)
+        self.lora_root = self.models_root / "loras"
+        self.lora_root.mkdir(parents=True, exist_ok=True)
+        self.upscale_model_id = upscale_model_id
+        self.logger = logger or logging.getLogger(__name__)
+        self._lock = threading.RLock()
+        self._hf_token = self._load_hf_token(models_root)
+
+        self._pipeline = None
+        self._img2img_pipeline = None
+        self._inpaint_pipeline = None
+        self._upscale_pipeline = None
+        self._current_model_id: Optional[str] = None
+        self._current_lora_key: Optional[str] = None
+        self._current_ip_adapter_mode: Optional[str] = None
+        self._device_info = DeviceInfo(kind="cpu", description="CPU", generator_device="cpu")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def ensure_pipeline(self, model_id: str, lora_config: LoRAConfig | None) -> DeviceInfo:
+        lora_key = lora_config.key() if lora_config else None
+        with self._lock:
+            if (
+                self._pipeline is not None
+                and self._current_model_id == model_id
+                and self._current_lora_key == lora_key
+            ):
+                return self._device_info
+
+            self._dispose_pipeline()
+            self._pipeline = self._create_pipeline(model_id, lora_config)
+            self._img2img_pipeline = None
+            self._inpaint_pipeline = None
+            self._current_model_id = model_id
+            self._current_lora_key = lora_key
+            return self._device_info
+
+    def ensure_lora_cached(self, source: str) -> None:
+        """Download a LoRA repo/weights into the local lora cache so they are
+        available offline when the user selects them later."""
+        source = source.strip()
+        if not source:
+            return
+        # If source is already a local path with safetensors files, nothing to download
+        local_path = Path(source)
+        if local_path.is_dir() and any(local_path.glob("*.safetensors")):
+            return
+        if local_path.is_file():
+            return
+
+        safe = source.replace("/", "__").replace(":", "_")
+        dest = self.lora_root / safe
+        dest.mkdir(parents=True, exist_ok=True)
+
+        try:
+            from huggingface_hub import snapshot_download
+            snapshot_download(
+                repo_id=source,
+                local_dir=str(dest),
+                local_dir_use_symlinks=False,
+                token=self._hf_token,
+                resume_download=True,
+            )
+            self.logger.info("LoRA cached: %s -> %s", source, dest)
+        except Exception as exc:
+            self.logger.warning("Failed to cache LoRA %s: %s", source, exc)
+            raise
+
+    def generate_image(
+        self,
+        *,
+        prompt: str,
+        negative_prompt: str,
+        width: int,
+        height: int,
+        steps: int,
+        guidance_scale: float,
+        seed: Optional[int],
+        strength: float = 0.7,
+        ref_mode: str = REF_MODE_IMG2IMG,
+        progress_callback: CallbackType = None,
+        reference_images: list[str] | None = None,
+    ) -> Image.Image:
+        with self._lock:
+            if self._pipeline is None:
+                raise RuntimeError("Pipeline not loaded")
+            pipe = self._pipeline
+            device_kind = self._device_info.kind
+            generator_device = self._device_info.generator_device
+
+        torch = _lazy_import_torch()
+
+        generator = None
+        if seed is not None:
+            gen_device = generator_device if device_kind in {"cuda", "cpu"} else "cpu"
+            generator = torch.Generator(device=gen_device).manual_seed(seed)
+
+        self.logger.info(
+            "Generating image | prompt=%s | steps=%s | size=%sx%s | model=%s",
+            prompt[:60],
+            steps,
+            width,
+            height,
+            self._current_model_id,
+        )
+
+        # Build the progress callback wrapper for diffusers >= 0.25
+        cb_kwargs = {}
+        if progress_callback is not None:
+            cb_kwargs["callback_on_step_end"] = lambda _pipe, step, _ts, cb_data: (
+                progress_callback(step, 0, None),
+                cb_data,
+            )[1]
+
+        # Handle reference images
+        if reference_images and ref_mode == REF_MODE_FACE:
+            # Face mode: composite reference onto a generated scene, then
+            # harmonise with a light img2img pass so the face is physically
+            # present in the output.
+            raw_ref = self._load_references_raw(reference_images)
+            if raw_ref is not None:
+                return self._generate_composite_refine(
+                    ref_image=raw_ref,
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    width=width,
+                    height=height,
+                    steps=steps,
+                    guidance_scale=guidance_scale,
+                    strength=strength,
+                    generator=generator,
+                    cb_kwargs=cb_kwargs,
+                )
+
+        if reference_images and ref_mode == REF_MODE_STYLE:
+            # Style mode: IP-Adapter captures overall aesthetics well.
+            raw_ref = self._load_references_raw(reference_images)
+            if raw_ref is not None:
+                return self._generate_ip_adapter(
+                    ref_mode=ref_mode,
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    ref_image=raw_ref,
+                    width=width,
+                    height=height,
+                    steps=steps,
+                    guidance_scale=guidance_scale,
+                    ip_scale=strength,
+                    generator=generator,
+                    cb_kwargs=cb_kwargs,
+                )
+
+        # Img2Img: resize/blend to output dimensions as init canvas
+        init_image = self._load_and_blend_references(reference_images, width, height)
+        if init_image is not None:
+            return self._generate_img2img(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                init_image=init_image,
+                width=width,
+                height=height,
+                steps=steps,
+                guidance_scale=guidance_scale,
+                strength=strength,
+                generator=generator,
+                cb_kwargs=cb_kwargs,
+            )
+
+        # Text-to-image path
+        call_kwargs = {
+            "negative_prompt": negative_prompt or None,
+            "num_inference_steps": steps,
+            "guidance_scale": guidance_scale,
+            "width": width,
+            "height": height,
+            "generator": generator,
+            **cb_kwargs,
+        }
+
+        try:
+            images = pipe(prompt, **call_kwargs).images
+            return images[0]
+        except Exception as exc:
+            self.logger.exception("Generation failed: %s", exc)
+            raise RuntimeError("Image generation failed") from exc
+
+    def upscale_image(self, base_image: Image.Image, prompt: str) -> Image.Image:
+        """AI-upscale an image using the SD x4 upscaler pipeline."""
+        torch = _lazy_import_torch()
+
+        with self._lock:
+            if self._upscale_pipeline is None:
+                self._upscale_pipeline = self._create_upscale_pipeline()
+            upscale_pipe = self._upscale_pipeline
+
+        # The x4 upscaler expects a low-res input; resize if too large
+        max_input = 512
+        w, h = base_image.size
+        if w > max_input or h > max_input:
+            scale = min(max_input / w, max_input / h)
+            base_image = base_image.resize(
+                (int(w * scale), int(h * scale)), Image.LANCZOS
+            )
+
+        base_image = base_image.convert("RGB")
+
+        try:
+            result = upscale_pipe(prompt=prompt, image=base_image, num_inference_steps=20).images[0]
+            return result
+        except Exception as exc:
+            self.logger.exception("AI upscale failed: %s", exc)
+            raise RuntimeError("AI upscale failed") from exc
+
+    # ------------------------------------------------------------------
+    # Reference image helpers
+    # ------------------------------------------------------------------
+    def _load_references_raw(
+        self,
+        reference_images: list[str] | None,
+    ) -> Image.Image | None:
+        """Load reference images at their original resolution for IP-Adapter.
+        If multiple images are provided, blend them at a common size without
+        forcing the output resolution.  Returns None if nothing loaded."""
+        if not reference_images:
+            return None
+
+        loaded: list[Image.Image] = []
+        for rp in reference_images:
+            try:
+                img = Image.open(rp).convert("RGB")
+                loaded.append(img)
+            except Exception as exc:
+                self.logger.warning("Failed to load reference image %s: %s", rp, exc)
+
+        if not loaded:
+            return None
+
+        if len(loaded) == 1:
+            return loaded[0]  # keep original size
+
+        # Multiple images: blend at the size of the largest one
+        max_w = max(img.width for img in loaded)
+        max_h = max(img.height for img in loaded)
+        resized = [img.resize((max_w, max_h), Image.LANCZOS) for img in loaded]
+        arrays = [np.asarray(img, dtype=np.float32) for img in resized]
+        blended = np.mean(arrays, axis=0).astype(np.uint8)
+        return Image.fromarray(blended, "RGB")
+
+    def _load_and_blend_references(
+        self,
+        reference_images: list[str] | None,
+        target_w: int,
+        target_h: int,
+    ) -> Image.Image | None:
+        """Load up to 3 reference images, resize them to the target
+        dimensions, and alpha-blend them equally into a single init image."""
+        if not reference_images:
+            return None
+
+        loaded: list[Image.Image] = []
+        for rp in reference_images:
+            try:
+                img = Image.open(rp).convert("RGB")
+                loaded.append(img)
+            except Exception as exc:
+                self.logger.warning("Failed to load reference image %s: %s", rp, exc)
+
+        if not loaded:
+            return None
+
+        if len(loaded) == 1:
+            return loaded[0].resize((target_w, target_h), Image.LANCZOS)
+
+        # Blend multiple images equally: resize all to target, then average
+        resized = [img.resize((target_w, target_h), Image.LANCZOS) for img in loaded]
+        arrays = [np.asarray(img, dtype=np.float32) for img in resized]
+        blended = np.mean(arrays, axis=0).astype(np.uint8)
+        return Image.fromarray(blended, "RGB")
+
+    # ------------------------------------------------------------------
+    # Interpret → IP-Adapter  (Face Reference)
+    # ------------------------------------------------------------------
+    def _generate_composite_refine(
+        self,
+        *,
+        ref_image: Image.Image,
+        prompt: str,
+        negative_prompt: str,
+        width: int,
+        height: int,
+        steps: int,
+        guidance_scale: float,
+        strength: float,
+        generator,
+        cb_kwargs: dict,
+    ) -> Image.Image:
+        """Two-phase face reference:
+        Phase 1 – *Interpret*: run img2img on the reference at high
+                  strength so the model redraws pixel-art / low-res input
+                  as a detailed character portrait.
+        Phase 2 – *Generate*: use the interpreted portrait as an
+                  IP-Adapter face reference for a fresh text2img pass.
+                  CLIP can now extract real face features from the
+                  high-quality interpreted image.
+        """
+        with self._lock:
+            pipe = self._pipeline
+
+        # === Phase 1: Interpret the reference ============================
+        self.logger.info(
+            "Face ref 1/2: interpreting reference (%s) via img2img…",
+            ref_image.size,
+        )
+        # Upscale to ~512 px on the long side, preserve aspect ratio,
+        # round to multiples of 8 (required by VAE).
+        orig_w, orig_h = ref_image.size
+        scale_factor = 512.0 / max(orig_w, orig_h)
+        interp_w = max(8, int(orig_w * scale_factor) // 8 * 8)
+        interp_h = max(8, int(orig_h * scale_factor) // 8 * 8)
+        ref_for_interp = ref_image.resize((interp_w, interp_h), Image.LANCZOS)
+
+        img2img_pipe = self._get_or_create_img2img_pipeline()
+
+        # Use a portrait-focused prompt with the user's style cues
+        interp_prompt = (
+            f"detailed character portrait, face close-up, "
+            f"high quality, sharp features, {prompt}"
+        )
+        interp_neg = "blurry, low quality, worst quality, pixelated, blocky"
+        if negative_prompt:
+            interp_neg = f"{interp_neg}, {negative_prompt}"
+
+        # High strength (0.70) to aggressively transform pixel-art into
+        # a real detailed character while keeping general colours / pose.
+        interpreted = img2img_pipe(
+            interp_prompt,
+            negative_prompt=interp_neg,
+            image=ref_for_interp,
+            strength=0.70,
+            num_inference_steps=max(15, steps),
+            guidance_scale=guidance_scale,
+            generator=generator,        # consumed here
+        ).images[0]
+        self.logger.info("Interpreted character: %s", interpreted.size)
+
+        # === Phase 2: IP-Adapter text2img with interpreted face ==========
+        self.logger.info(
+            "Face ref 2/2: generating scene with IP-Adapter face ref…",
+        )
+        self._ensure_ip_adapter_loaded(REF_MODE_FACE)
+        pipe.set_ip_adapter_scale(strength)
+
+        call_kwargs = {
+            "negative_prompt": negative_prompt or None,
+            "ip_adapter_image": interpreted,
+            "num_inference_steps": steps,
+            "guidance_scale": guidance_scale,
+            "width": width,
+            "height": height,
+            **cb_kwargs,
+        }
+        try:
+            self.logger.info(
+                "IP-Adapter (face) | scale=%.2f | interp_size=%s | "
+                "output=%sx%s",
+                strength, interpreted.size, width, height,
+            )
+            images = pipe(prompt, **call_kwargs).images
+            return images[0]
+        except Exception as exc:
+            self.logger.exception("IP-Adapter generation failed: %s", exc)
+            raise RuntimeError("IP-Adapter generation failed") from exc
+
+    # ------------------------------------------------------------------
+    # IP-Adapter helpers  (Style Reference)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _upscale_for_clip(image: Image.Image, min_size: int = 512) -> Image.Image:
+        """Upscale a tiny reference so CLIP can extract meaningful features.
+        Uses LANCZOS for smooth upscaling; preserves aspect ratio."""
+        w, h = image.size
+        if w >= min_size and h >= min_size:
+            return image
+        scale = max(min_size / w, min_size / h)
+        new_w, new_h = int(w * scale), int(h * scale)
+        return image.resize((new_w, new_h), Image.LANCZOS)
+
+    def _generate_ip_adapter(
+        self,
+        *,
+        ref_mode: str,
+        prompt: str,
+        negative_prompt: str,
+        ref_image: Image.Image,
+        width: int,
+        height: int,
+        steps: int,
+        guidance_scale: float,
+        ip_scale: float,
+        generator,
+        cb_kwargs: dict,
+    ) -> Image.Image:
+        """Generate using text2img + IP-Adapter conditioning.
+        The reference image is used as an 'image prompt' via IP-Adapter
+        while the text prompt fully controls the scene composition.
+        Tiny references are upscaled so CLIP can extract useful features."""
+        with self._lock:
+            pipe = self._pipeline
+
+        self._ensure_ip_adapter_loaded(ref_mode)
+        pipe.set_ip_adapter_scale(ip_scale)
+
+        # Upscale tiny references so CLIP ViT-H can see them properly
+        orig_size = ref_image.size
+        ref_image = self._upscale_for_clip(ref_image)
+
+        call_kwargs = {
+            "negative_prompt": negative_prompt or None,
+            "ip_adapter_image": ref_image,
+            "num_inference_steps": steps,
+            "guidance_scale": guidance_scale,
+            "width": width,
+            "height": height,
+            "generator": generator,
+            **cb_kwargs,
+        }
+
+        mode_label = "face" if ref_mode == REF_MODE_FACE else "style"
+        try:
+            self.logger.info(
+                "Running text2img + IP-Adapter (%s) | ip_scale=%.2f | "
+                "ref_orig=%s ref_clip=%s | output=%sx%s",
+                mode_label, ip_scale, orig_size,
+                ref_image.size, width, height,
+            )
+            images = pipe(prompt, **call_kwargs).images
+            return images[0]
+        except Exception as exc:
+            self.logger.exception("IP-Adapter generation failed: %s", exc)
+            raise RuntimeError("IP-Adapter generation failed") from exc
+
+    def _ensure_ip_adapter_loaded(self, ref_mode: str) -> None:
+        """Load (or swap) the correct IP-Adapter weights on the main pipeline.
+        Skips loading if the requested mode is already active."""
+        if self._current_ip_adapter_mode == ref_mode:
+            return
+
+        with self._lock:
+            pipe = self._pipeline
+            if pipe is None:
+                raise RuntimeError("Base pipeline not loaded")
+
+            # Unload previous IP-Adapter if any
+            if self._current_ip_adapter_mode is not None:
+                try:
+                    pipe.unload_ip_adapter()
+                    self.logger.info("Unloaded previous IP-Adapter")
+                except Exception as exc:
+                    self.logger.warning("Failed to unload IP-Adapter: %s", exc)
+
+            weight_name = IP_ADAPTER_WEIGHTS.get(ref_mode)
+            if weight_name is None:
+                self._current_ip_adapter_mode = None
+                return
+
+            load_kwargs = {}
+            if self._hf_token:
+                load_kwargs["token"] = self._hf_token
+
+            try:
+                # IP-Adapter is incompatible with SlicedAttnProcessor set by
+                # enable_attention_slicing(); undo it, then reset UNet processors.
+                try:
+                    pipe.disable_attention_slicing()
+                    self.logger.info("Disabled attention slicing for IP-Adapter compat")
+                except Exception as e1:
+                    self.logger.warning("disable_attention_slicing failed: %s", e1)
+                try:
+                    from diffusers.models.attention_processor import AttnProcessor
+                    pipe.unet.set_attn_processor(AttnProcessor())
+                    self.logger.info("Reset UNet attn processors to AttnProcessor")
+                except Exception as e2:
+                    self.logger.warning("set_attn_processor fallback failed: %s", e2)
+
+                self.logger.info(
+                    "Loading IP-Adapter: %s/%s/%s",
+                    IP_ADAPTER_REPO, IP_ADAPTER_SUBFOLDER, weight_name,
+                )
+                pipe.load_ip_adapter(
+                    IP_ADAPTER_REPO,
+                    subfolder=IP_ADAPTER_SUBFOLDER,
+                    weight_name=weight_name,
+                    image_encoder_folder="models/image_encoder",
+                    **load_kwargs,
+                )
+                self._current_ip_adapter_mode = ref_mode
+                self.logger.info("IP-Adapter loaded: %s", weight_name)
+            except Exception as exc:
+                self._current_ip_adapter_mode = None
+                self.logger.exception("Failed to load IP-Adapter: %s", exc)
+                raise RuntimeError(
+                    f"Failed to load IP-Adapter ({ref_mode}). "
+                    "Make sure you have internet access for the first download. "
+                    f"Error: {exc}"
+                ) from exc
+
+    def _generate_img2img(
+        self,
+        *,
+        prompt: str,
+        negative_prompt: str,
+        init_image: Image.Image,
+        width: int,
+        height: int,
+        steps: int,
+        guidance_scale: float,
+        strength: float,
+        generator,
+        cb_kwargs: dict,
+    ) -> Image.Image:
+        """Run img2img generation using the SDXL Img2Img pipeline,
+        reusing components from the already-loaded text2img pipeline."""
+        img2img_pipe = self._get_or_create_img2img_pipeline()
+
+        # img2img does not accept width/height directly; the output size
+        # matches the input image, so the init_image is already resized.
+        call_kwargs = {
+            "negative_prompt": negative_prompt or None,
+            "image": init_image,
+            "strength": strength,
+            "num_inference_steps": steps,
+            "guidance_scale": guidance_scale,
+            "generator": generator,
+            **cb_kwargs,
+        }
+
+        try:
+            self.logger.info(
+                "Running SDXL img2img | strength=%.2f | init_size=%s",
+                strength,
+                init_image.size,
+            )
+            images = img2img_pipe(prompt, **call_kwargs).images
+            return images[0]
+        except Exception as exc:
+            self.logger.exception("Img2Img generation failed: %s", exc)
+            raise RuntimeError("Img2Img generation failed") from exc
+
+    def _get_or_create_inpaint_pipeline(self):
+        """Create an SDXL Inpaint pipeline reusing the loaded text2img
+        pipeline’s components (shared GPU memory).  Works in ‘legacy’
+        latent-blending mode with the standard (non-inpaint) UNet."""
+        with self._lock:
+            if self._inpaint_pipeline is not None:
+                return self._inpaint_pipeline
+
+            if self._pipeline is None:
+                raise RuntimeError("Base pipeline not loaded")
+
+            try:
+                from diffusers import StableDiffusionXLInpaintPipeline  # type: ignore
+            except ImportError:
+                raise RuntimeError(
+                    "StableDiffusionXLInpaintPipeline not available. "
+                    "Please upgrade diffusers: pip install -U diffusers"
+                )
+
+            self._inpaint_pipeline = StableDiffusionXLInpaintPipeline(
+                vae=self._pipeline.vae,
+                text_encoder=self._pipeline.text_encoder,
+                text_encoder_2=self._pipeline.text_encoder_2,
+                tokenizer=self._pipeline.tokenizer,
+                tokenizer_2=self._pipeline.tokenizer_2,
+                unet=self._pipeline.unet,
+                scheduler=self._pipeline.scheduler,
+            )
+            self.logger.info("Created SDXL Inpaint pipeline (shared weights)")
+            return self._inpaint_pipeline
+
+    def _get_or_create_img2img_pipeline(self):
+        """Create an SDXL Img2Img pipeline by reusing components from the
+        loaded text2img pipeline to avoid doubling VRAM usage."""
+        with self._lock:
+            if self._img2img_pipeline is not None:
+                return self._img2img_pipeline
+
+            if self._pipeline is None:
+                raise RuntimeError("Base pipeline not loaded")
+
+            try:
+                from diffusers import StableDiffusionXLImg2ImgPipeline  # type: ignore
+            except ImportError:
+                raise RuntimeError(
+                    "StableDiffusionXLImg2ImgPipeline not available. "
+                    "Please upgrade diffusers: pip install -U diffusers"
+                )
+
+            # Build from the components of the already-loaded pipeline
+            # so we share the model weights in GPU memory
+            self._img2img_pipeline = StableDiffusionXLImg2ImgPipeline(
+                vae=self._pipeline.vae,
+                text_encoder=self._pipeline.text_encoder,
+                text_encoder_2=self._pipeline.text_encoder_2,
+                tokenizer=self._pipeline.tokenizer,
+                tokenizer_2=self._pipeline.tokenizer_2,
+                unet=self._pipeline.unet,
+                scheduler=self._pipeline.scheduler,
+            )
+            self.logger.info("Created SDXL Img2Img pipeline (shared weights)")
+            return self._img2img_pipeline
+
+    # ------------------------------------------------------------------
+    # Pipeline construction
+    # ------------------------------------------------------------------
+    def _load_hf_token(self, models_root: Path) -> Optional[str]:
+        """Load Hugging Face token from project token.txt or environment variables."""
+        try:
+            token_file = models_root.parent / "token.txt"
+            if token_file.exists():
+                token = token_file.read_text(encoding="utf-8").strip()
+                if token:
+                    return token
+
+            for name in ("HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HF_HUB_TOKEN"):
+                val = os.environ.get(name)
+                if val:
+                    return val
+        except Exception as exc:
+            try:
+                self.logger.warning("Failed to read Hugging Face token: %s", exc)
+            except Exception:
+                pass
+        return None
+
+    def _model_dir_for_id(self, model_id: str) -> Path:
+        """Return a local cache directory path for a given model id."""
+        safe_name = model_id.replace("/", "__").replace(":", "_")
+        return self.models_root / safe_name
+
+    def _dispose_pipeline(self) -> None:
+        """Dispose of the currently loaded pipeline, freeing device memory."""
+        torch = _lazy_import_torch()
+        # Unload IP-Adapter before disposing
+        if self._current_ip_adapter_mode is not None:
+            try:
+                if self._pipeline is not None:
+                    self._pipeline.unload_ip_adapter()
+            except Exception:
+                pass
+            self._current_ip_adapter_mode = None
+
+        for attr in ("_inpaint_pipeline", "_img2img_pipeline", "_pipeline"):
+            try:
+                pipe = getattr(self, attr, None)
+                if pipe is not None:
+                    try:
+                        pipe.to("cpu")
+                    except Exception:
+                        pass
+                    setattr(self, attr, None)
+                    del pipe
+            except Exception as exc:
+                self.logger.warning("Error disposing %s: %s", attr, exc)
+
+        # Free CUDA cache
+        try:
+            if hasattr(torch, "cuda") and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def _create_pipeline(self, model_id: str, lora_config: LoRAConfig | None):
+        """Create and return an optimized SDXL pipeline."""
+        torch = _lazy_import_torch()
+        _SDXLPipeline = _lazy_import_sdxl_pipeline()
+
+        local_dir = self._model_dir_for_id(model_id)
+        local_dir.mkdir(parents=True, exist_ok=True)
+
+        load_kwargs = {
+            "cache_dir": str(local_dir),
+            "torch_dtype": torch.float16,
+            "variant": "fp16",
+        }
+        if self._hf_token:
+            load_kwargs["token"] = self._hf_token
+
+        # Try fp16 variant first, fall back to default dtype
+        try:
+            self.logger.info("Loading pipeline for model %s (cache=%s, fp16)", model_id, local_dir)
+            pipe = _SDXLPipeline.from_pretrained(model_id, **load_kwargs)
+        except Exception:
+            self.logger.info("fp16 variant not found, trying default precision")
+            load_kwargs.pop("variant", None)
+            try:
+                pipe = _SDXLPipeline.from_pretrained(model_id, **load_kwargs)
+            except Exception as exc:
+                self.logger.exception("Failed to load pipeline for model %s: %s", model_id, exc)
+                raise
+
+        # Determine device
+        try:
+            if hasattr(torch, "cuda") and torch.cuda.is_available():
+                try:
+                    devname = torch.cuda.get_device_name(0)
+                except Exception:
+                    devname = "CUDA"
+                self._device_info = DeviceInfo(kind="cuda", description=devname, generator_device="cuda")
+            else:
+                self._device_info = DeviceInfo(kind="cpu", description="CPU", generator_device="cpu")
+        except Exception:
+            self._device_info = DeviceInfo(kind="cpu", description="CPU", generator_device="cpu")
+
+        # Move to device
+        try:
+            pipe = pipe.to(self._device_info.generator_device)
+        except Exception:
+            try:
+                pipe = pipe.to("cpu")
+            except Exception:
+                self.logger.warning("Failed to move pipeline to device; leaving as-loaded")
+
+        # Apply optimizations
+        self._apply_optimizations(pipe)
+
+        # Apply LoRA if configured
+        if lora_config is not None:
+            self._apply_lora(pipe, lora_config)
+
+        return pipe
+
+    def _apply_optimizations(self, pipe) -> None:
+        """Apply VRAM and speed optimizations to the pipeline."""
+        # DPMSolver++ Karras scheduler for sharper outputs
+        try:
+            from diffusers import DPMSolverMultistepScheduler  # type: ignore
+            pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+                pipe.scheduler.config,
+                algorithm_type="dpmsolver++",
+                use_karras_sigmas=True,
+            )
+            self.logger.info("Switched scheduler to DPMSolver++ (Karras)")
+        except Exception as exc:
+            self.logger.warning("Could not switch scheduler: %s", exc)
+
+        # Attention slicing (reduces peak VRAM)
+        try:
+            pipe.enable_attention_slicing()
+            self.logger.info("Enabled attention slicing")
+        except Exception:
+            pass
+
+        # VAE slicing and tiling for lower VRAM
+        try:
+            pipe.enable_vae_slicing()
+            self.logger.info("Enabled VAE slicing")
+        except Exception:
+            pass
+        try:
+            pipe.enable_vae_tiling()
+            self.logger.info("Enabled VAE tiling")
+        except Exception:
+            pass
+
+        # xFormers memory-efficient attention (optional)
+        try:
+            pipe.enable_xformers_memory_efficient_attention()
+            self.logger.info("Enabled xFormers memory-efficient attention")
+        except Exception:
+            self.logger.debug("xFormers not available; using default attention")
+
+    def _apply_lora(self, pipe, lora_config: LoRAConfig) -> None:
+        """Load and fuse LoRA weights into the pipeline."""
+        source = lora_config.source.strip()
+        if not source:
+            return
+
+        self.logger.info("Loading LoRA from %s (weight=%s, scale=%.2f)",
+                         source, lora_config.weight_name, lora_config.scale)
+
+        try:
+            # Determine the actual path/repo to load from
+            local_path = Path(source)
+            safe = source.replace("/", "__").replace(":", "_")
+            cached_dir = self.lora_root / safe
+
+            load_kwargs = {}
+            if lora_config.weight_name:
+                load_kwargs["weight_name"] = lora_config.weight_name
+            if self._hf_token:
+                load_kwargs["token"] = self._hf_token
+
+            if local_path.is_dir():
+                pipe.load_lora_weights(str(local_path), **load_kwargs)
+            elif local_path.is_file():
+                pipe.load_lora_weights(
+                    str(local_path.parent),
+                    weight_name=local_path.name,
+                )
+            elif cached_dir.is_dir() and any(cached_dir.glob("*.safetensors")):
+                pipe.load_lora_weights(str(cached_dir), **load_kwargs)
+            else:
+                pipe.load_lora_weights(source, **load_kwargs)
+
+            pipe.fuse_lora(lora_scale=lora_config.scale)
+            self.logger.info("LoRA fused successfully (scale=%.2f)", lora_config.scale)
+        except Exception as exc:
+            self.logger.warning("Failed to load/fuse LoRA: %s", exc)
+            raise
+
+    def _create_upscale_pipeline(self):
+        """Create the SD x4 upscaler pipeline."""
+        torch = _lazy_import_torch()
+        try:
+            from diffusers import StableDiffusionUpscalePipeline  # type: ignore
+        except ImportError:
+            raise RuntimeError("StableDiffusionUpscalePipeline not available")
+
+        load_kwargs = {"torch_dtype": torch.float16}
+        if self._hf_token:
+            load_kwargs["token"] = self._hf_token
+
+        local_dir = self._model_dir_for_id(self.upscale_model_id)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        load_kwargs["cache_dir"] = str(local_dir)
+
+        pipe = StableDiffusionUpscalePipeline.from_pretrained(
+            self.upscale_model_id, **load_kwargs
+        )
+        pipe = pipe.to(self._device_info.generator_device)
+        try:
+            pipe.enable_attention_slicing()
+        except Exception:
+            pass
+        self.logger.info("Loaded upscale pipeline: %s", self.upscale_model_id)
+        return pipe
+
+
+# ------------------------------------------------------------------
+# Module-level helpers
+# ------------------------------------------------------------------
+def _lazy_import_torch():
+    try:
+        import torch
+        return torch
+    except ImportError as exc:
+        raise RuntimeError("PyTorch is not installed: %s" % exc)
+
+
+def _lazy_import_sdxl_pipeline():
+    try:
+        from diffusers import StableDiffusionXLPipeline  # type: ignore
+        return StableDiffusionXLPipeline
+    except ImportError:
+        try:
+            from diffusers import StableDiffusionPipeline  # type: ignore
+            return StableDiffusionPipeline
+        except ImportError as exc:
+            raise RuntimeError("Could not import a compatible diffusers pipeline: %s" % exc)
