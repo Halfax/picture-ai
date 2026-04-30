@@ -12,15 +12,8 @@ from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
 
 from .logging_utils import configure_logging
-from .pipeline_manager import LoRAConfig, PipelineManager, REF_MODE_IMG2IMG, REF_MODE_FACE, REF_MODE_STYLE
+from .pipeline_manager import LoRAConfig, PipelineManager
 from .settings_store import DEFAULT_MODEL_IDS, SettingsStore, UserSettings
-
-REF_MODE_LABELS = {
-    "Img2Img (Regenerate)": REF_MODE_IMG2IMG,
-    "Face Reference (IP-Adapter)": REF_MODE_FACE,
-    "Style Reference (IP-Adapter)": REF_MODE_STYLE,
-}
-REF_MODE_LABELS_INV = {v: k for k, v in REF_MODE_LABELS.items()}
 
 STYLE_PRESETS: dict[str, tuple[str, str]] = {
     "Photoreal portrait": (
@@ -79,7 +72,7 @@ class PictureAIApp(tk.Tk):
         pipeline_manager: PipelineManager,
     ) -> None:
         super().__init__()
-        self.title("Halfax Image Generator")
+        self.title("Picture AI Generator")
         self.geometry("960x760")
 
         self.logger = logger
@@ -249,73 +242,11 @@ class PictureAIApp(tk.Tk):
         self.status_label = ttk.Label(top_frame, text="Model not loaded", foreground="gray")
         self.status_label.grid(row=9, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
 
-        # Reference images UI (up to 3)
-        ref_frame = ttk.LabelFrame(top_frame, text="Reference images (up to 3)")
-        ref_frame.grid(row=10, column=0, columnspan=4, sticky=tk.EW, pady=(10, 0))
-        ref_frame.columnconfigure(0, weight=1)
-
-        self.reference_paths: list[str] = ["", "", ""]
-        self._ref_thumb_imgs: list[Optional[ImageTk.PhotoImage]] = [None, None, None]
-
-        for i in range(3):
-            btn = ttk.Button(ref_frame, text=f"Add / Change #{i+1}", command=lambda i=i: self._choose_reference_image(i))
-            btn.grid(row=0, column=i, padx=5)
-            rem = ttk.Button(ref_frame, text="Remove", command=lambda i=i: self._remove_reference_image(i))
-            rem.grid(row=1, column=i, padx=5)
-            lbl = ttk.Label(ref_frame, text="(empty)", anchor=tk.CENTER)
-            lbl.grid(row=2, column=i, padx=5)
-            # store label widgets for thumbnail updates
-            if not hasattr(self, "_ref_labels"):
-                self._ref_labels = []
-            self._ref_labels.append(lbl)
-
-        mode_row = ttk.Frame(ref_frame)
-        mode_row.grid(row=3, column=0, columnspan=3, sticky=tk.EW, pady=(5, 0))
-        ttk.Label(mode_row, text="Mode:").pack(side=tk.LEFT)
-        saved_label = REF_MODE_LABELS_INV.get(self.user_settings.ref_mode, "Img2Img (Regenerate)")
-        self.ref_mode_var = tk.StringVar(value=saved_label)
-        ref_mode_combo = ttk.Combobox(
-            mode_row,
-            textvariable=self.ref_mode_var,
-            values=list(REF_MODE_LABELS.keys()),
-            state="readonly",
-            width=30,
-        )
-        ref_mode_combo.pack(side=tk.LEFT, padx=(5, 0))
-
-        strength_row = ttk.Frame(ref_frame)
-        strength_row.grid(row=4, column=0, columnspan=3, sticky=tk.EW, pady=(5, 5))
-        ttk.Label(strength_row, text="Strength / IP scale:").pack(side=tk.LEFT)
-        self.ref_strength_var = tk.DoubleVar(value=self.user_settings.ref_strength)
-        ttk.Spinbox(
-            strength_row,
-            from_=0.1,
-            to=1.0,
-            increment=0.05,
-            textvariable=self.ref_strength_var,
-            width=6,
-        ).pack(side=tk.LEFT, padx=(5, 0))
-        self._ref_strength_hint = ttk.Label(strength_row, text="")
-        self._ref_strength_hint.pack(side=tk.LEFT, padx=(10, 0))
-        self.ref_mode_var.trace_add("write", lambda *_: self._update_ref_mode_hint())
-        self._update_ref_mode_hint()
-
         image_frame = ttk.Frame(self, padding=10)
         image_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         self.image_label = ttk.Label(image_frame, text="No image yet", anchor=tk.CENTER)
         self.image_label.pack(fill=tk.BOTH, expand=True)
-
-    def _update_ref_mode_hint(self) -> None:
-        """Update the hint text next to the strength spinner based on selected mode."""
-        label = self.ref_mode_var.get()
-        mode = REF_MODE_LABELS.get(label, REF_MODE_IMG2IMG)
-        hints = {
-            REF_MODE_IMG2IMG: "(low = subtle change, high = redraw closely)",
-            REF_MODE_FACE: "(how strongly the interpreted face guides the new scene)",
-            REF_MODE_STYLE: "(how strongly the style influences the new scene)",
-        }
-        self._ref_strength_hint.config(text=hints.get(mode, ""))
 
     def _add_labeled_row(self, frame: ttk.Frame, *, row: int, label: str, widget: ttk.Widget, span: int = 1) -> None:
         ttk.Label(frame, text=label).grid(row=row, column=0, sticky=tk.W, pady=(5 if row else 0, 0))
@@ -345,17 +276,6 @@ class PictureAIApp(tk.Tk):
         self.lora_source_var.set(self.user_settings.lora_source)
         self.lora_weight_var.set(self.user_settings.lora_weight_name)
         self.lora_scale_var.set(self.user_settings.lora_scale)
-
-        # Load reference images paths, mode and strength from settings
-        self.ref_strength_var.set(self.user_settings.ref_strength)
-        saved_label = REF_MODE_LABELS_INV.get(self.user_settings.ref_mode, "Img2Img (Regenerate)")
-        self.ref_mode_var.set(saved_label)
-        self._update_ref_mode_hint()
-        refs = self.user_settings.reference_images or []
-        # Normalize to length 3
-        refs = (refs + [""] * 3)[:3]
-        self.reference_paths = refs
-        self._update_reference_previews()
 
         self._apply_theme(self.user_settings.dark_mode)
         self._sync_size_preset_to_dimensions(self.width_var.get(), self.height_var.get())
@@ -473,10 +393,6 @@ class PictureAIApp(tk.Tk):
 
         negative_prompt = self.negative_prompt_entry.get().strip()
         lora_config = self._current_lora_config()
-        reference_images = [p for p in self.reference_paths if p]
-        ref_strength = max(0.1, min(1.0, float(self.ref_strength_var.get() or 0.7)))
-        ref_mode = REF_MODE_LABELS.get(self.ref_mode_var.get(), REF_MODE_IMG2IMG)
-
         if self.lora_enabled_var.get() and lora_config is None:
             messagebox.showwarning("LoRA Missing", "Enable LoRA requires a source path or Hugging Face repo ID.")
             self._toggle_generation_controls(disabled=False)
@@ -512,10 +428,7 @@ class PictureAIApp(tk.Tk):
                     steps=steps,
                     guidance_scale=guidance_scale,
                     seed=seed,
-                    strength=ref_strength,
-                    ref_mode=ref_mode,
                     progress_callback=self._progress_callback,
-                    reference_images=reference_images,
                 )
                 self.after(0, lambda img=image: self._finish_generation(img))
             except Exception as exc:  # pragma: no cover
@@ -699,9 +612,6 @@ class PictureAIApp(tk.Tk):
             lora_scale=float(self.lora_scale_var.get() or 1.0),
             size_preset=self.size_preset_var.get() or SIZE_PRESET_CUSTOM,
             lora_preset=self.lora_preset_var.get() or LORA_PRESET_CUSTOM,
-            ref_strength=float(self.ref_strength_var.get() or 0.7),
-            ref_mode=REF_MODE_LABELS.get(self.ref_mode_var.get(), REF_MODE_IMG2IMG),
-            reference_images=[p for p in self.reference_paths if p],
         )
         self.settings_store.save_user_settings(settings)
 
@@ -921,37 +831,6 @@ class PictureAIApp(tk.Tk):
                     del self._lora_preset_errors[label]
 
         self.after(0, updater)
-
-    # Reference images helpers
-    def _choose_reference_image(self, index: int) -> None:
-        path = filedialog.askopenfilename(title="Select reference image", filetypes=[("Images", "*.png;*.jpg;*.jpeg;*.webp;*.bmp" )])
-        if not path:
-            return
-        self.reference_paths[index] = path
-        self._update_reference_previews()
-        self._save_settings()
-
-    def _remove_reference_image(self, index: int) -> None:
-        self.reference_paths[index] = ""
-        self._update_reference_previews()
-        self._save_settings()
-
-    def _update_reference_previews(self) -> None:
-        from PIL import Image as PILImage
-
-        for i, lbl in enumerate(getattr(self, "_ref_labels", [])):
-            path = self.reference_paths[i]
-            if path:
-                try:
-                    img = PILImage.open(path)
-                    img.thumbnail((96, 96))
-                    tkimg = ImageTk.PhotoImage(img)
-                    self._ref_thumb_imgs[i] = tkimg
-                    lbl.config(image=tkimg, text="")
-                except Exception:
-                    lbl.config(text="(invalid)", image="")
-            else:
-                lbl.config(text="(empty)", image="")
 
 
 def launch_app() -> None:

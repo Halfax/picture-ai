@@ -1,7 +1,6 @@
 transformers==4.57.1
 accelerate==1.12.0
 safetensors==0.7.0
-numpy
 pillow
 diffusers[torch]==0.35.2
 peft==0.18.1

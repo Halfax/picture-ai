@@ -32,10 +32,6 @@ class UserSettings:
     lora_scale: float = 0.8
     size_preset: str = "Custom"
     lora_preset: str = "Custom"
-    ref_strength: float = 0.7
-    ref_mode: str = "img2img"
-    # Up to 3 reference image paths (local file paths). Empty list by default.
-    reference_images: list[str] = None
 
 
 class SettingsStore:
@@ -53,22 +49,11 @@ class SettingsStore:
     # ------------------------------------------------------------------
     def load_user_settings(self) -> UserSettings:
         if not self.settings_path.is_file():
-            # default should have reference_images as an empty list
-            defaults = asdict(UserSettings())
-            defaults["reference_images"] = []
-            return UserSettings(**defaults)  # type: ignore[arg-type]
+            return UserSettings()
 
         try:
             data = json.loads(self.settings_path.read_text(encoding="utf-8"))
-            merged = {**asdict(UserSettings()), **data}  # type: ignore[arg-type]
-            # Ensure reference_images is a list of up to 3 strings
-            refs = merged.get("reference_images") or []
-            if not isinstance(refs, list):
-                refs = []
-            refs = [str(r) for r in refs if r]
-            refs = refs[:3]
-            merged["reference_images"] = refs
-            return UserSettings(**merged)  # type: ignore[arg-type]
+            return UserSettings(**{**asdict(UserSettings()), **data})  # type: ignore[arg-type]
         except Exception as exc:  # pragma: no cover - defensive path
             self.logger.warning("Failed to read settings file %s: %s", self.settings_path, exc)
             return UserSettings()
@@ -76,9 +61,6 @@ class SettingsStore:
     def save_user_settings(self, settings: UserSettings) -> None:
         try:
             payload = asdict(settings)
-            # Ensure reference_images is a list (not None)
-            if payload.get("reference_images") is None:
-                payload["reference_images"] = []
             self.settings_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception as exc:  # pragma: no cover - defensive path
             self.logger.error("Failed to write settings file %s: %s", self.settings_path, exc)
