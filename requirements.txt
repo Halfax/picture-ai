@@ -6,3 +6,4 @@ pillow
 diffusers[torch]==0.35.2
 peft==0.18.1
 huggingface-hub>=0.34.0,<1.0
+compel>=2.0.2,<3.0

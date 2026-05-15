@@ -10,6 +10,8 @@ DEFAULT_MODEL_IDS: list[str] = [
     "stabilityai/stable-diffusion-xl-base-1.0",
     "SG161222/RealVisXL_V5.0",
     "RunDiffusion/Juggernaut-XL-v9",
+    "RunDiffusion/Juggernaut-XI-v11",
+    "John6666/lustify-sdxl-nsfwsfw-endgame-sdxl",
 ]
 DEFAULT_STYLE = "Photoreal portrait"
 
@@ -34,6 +36,11 @@ class UserSettings:
     lora_preset: str = "Custom"
     ref_strength: float = 0.7
     ref_mode: str = "img2img"
+    sampler: str = "DPM++ 2M Karras"
+    quality_booster: bool = True
+    hires_fix: bool = False
+    hires_scale: float = 1.5
+    hires_strength: float = 0.35
     # Up to 3 reference image paths (local file paths). Empty list by default.
     reference_images: list[str] = None
 
