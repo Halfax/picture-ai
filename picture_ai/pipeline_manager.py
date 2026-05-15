@@ -25,6 +25,29 @@ IP_ADAPTER_WEIGHTS = {
     REF_MODE_STYLE: "ip-adapter-plus_sdxl_vit-h.safetensors",
 }
 
+# Samplers (UI label → diffusers scheduler class name + from_config kwargs).
+# Names match the A1111 conventions written into PNG metadata.
+# `euler_at_final` defends against an IndexError on the last step when a
+# checkpoint ships a scheduler_config.json with a non-default
+# `final_sigmas_type` (hit by John6666/lustify-* on 2026-05-15). Unlike
+# `lower_order_final`, this fires regardless of step count — diffusers gates
+# `lower_order_final` behind `len(timesteps) < 15`, so it doesn't help at 20+
+# steps. `euler_at_final=True` matches A1111's "Karras" sampler behavior.
+_DPM_SAFE = {"euler_at_final": True}
+SAMPLERS: dict[str, tuple[str, dict]] = {
+    "DPM++ 2M Karras": (
+        "DPMSolverMultistepScheduler",
+        {"algorithm_type": "dpmsolver++", "use_karras_sigmas": True, **_DPM_SAFE},
+    ),
+    "DPM++ SDE Karras": (
+        "DPMSolverMultistepScheduler",
+        {"algorithm_type": "sde-dpmsolver++", "use_karras_sigmas": True, **_DPM_SAFE},
+    ),
+    "Euler a": ("EulerAncestralDiscreteScheduler", {}),
+    "UniPC": ("UniPCMultistepScheduler", {}),
+}
+DEFAULT_SAMPLER = "DPM++ 2M Karras"
+
 
 @dataclass(slots=True)
 class LoRAConfig:
@@ -66,8 +89,10 @@ class PipelineManager:
         self._img2img_pipeline = None
         self._inpaint_pipeline = None
         self._upscale_pipeline = None
+        self._compel = None
         self._current_model_id: Optional[str] = None
         self._current_lora_key: Optional[str] = None
+        self._current_sampler: Optional[str] = None
         self._current_ip_adapter_mode: Optional[str] = None
         self._device_info = DeviceInfo(kind="cpu", description="CPU", generator_device="cpu")
 
@@ -137,6 +162,9 @@ class PipelineManager:
         ref_mode: str = REF_MODE_IMG2IMG,
         progress_callback: CallbackType = None,
         reference_images: list[str] | None = None,
+        hires_fix: bool = False,
+        hires_scale: float = 1.5,
+        hires_strength: float = 0.35,
     ) -> Image.Image:
         with self._lock:
             if self._pipeline is None:
@@ -225,7 +253,6 @@ class PipelineManager:
 
         # Text-to-image path
         call_kwargs = {
-            "negative_prompt": negative_prompt or None,
             "num_inference_steps": steps,
             "guidance_scale": guidance_scale,
             "width": width,
@@ -234,12 +261,30 @@ class PipelineManager:
             **cb_kwargs,
         }
 
+        embeds = self._encode_prompts(prompt, negative_prompt)
         try:
-            images = pipe(prompt, **call_kwargs).images
-            return images[0]
+            if embeds is not None:
+                images = pipe(**embeds, **call_kwargs).images
+            else:
+                call_kwargs["negative_prompt"] = negative_prompt or None
+                images = pipe(prompt, **call_kwargs).images
+            base_image = images[0]
         except Exception as exc:
             self.logger.exception("Generation failed: %s", exc)
             raise RuntimeError("Image generation failed") from exc
+
+        if hires_fix and hires_scale > 1.01:
+            return self._hires_pass(
+                base_image=base_image,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                scale=hires_scale,
+                strength=hires_strength,
+                steps=steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+            )
+        return base_image
 
     def upscale_image(self, base_image: Image.Image, prompt: str) -> Image.Image:
         """AI-upscale an image using the SD x4 upscaler pipeline."""
@@ -267,6 +312,52 @@ class PipelineManager:
         except Exception as exc:
             self.logger.exception("AI upscale failed: %s", exc)
             raise RuntimeError("AI upscale failed") from exc
+
+    # ------------------------------------------------------------------
+    # Prompt encoding (compel — weighted, >77-token SDXL prompts)
+    # ------------------------------------------------------------------
+    def _get_compel(self):
+        if self._compel is not None:
+            return self._compel
+        if self._pipeline is None:
+            return None
+        Compel, ReturnedEmbeddingsType = _lazy_import_compel()
+        if Compel is None:
+            return None
+        try:
+            self._compel = Compel(
+                tokenizer=[self._pipeline.tokenizer, self._pipeline.tokenizer_2],
+                text_encoder=[self._pipeline.text_encoder, self._pipeline.text_encoder_2],
+                returned_embeddings_type=ReturnedEmbeddingsType.PENULTIMATE_HIDDEN_STATES_NON_NORMALIZED,
+                requires_pooled=[False, True],
+                truncate_long_prompts=False,
+            )
+            self.logger.info("Initialized compel for weighted/long SDXL prompts")
+            return self._compel
+        except Exception as exc:
+            self.logger.warning("Failed to init compel: %s", exc)
+            return None
+
+    def _encode_prompts(self, prompt: str, negative_prompt: str) -> dict | None:
+        """Return prompt_embeds kwargs dict if compel is available, else None.
+        Caller falls back to raw prompt= / negative_prompt= when None is
+        returned (which silently truncates >77 tokens)."""
+        compel = self._get_compel()
+        if compel is None:
+            return None
+        try:
+            cond, pooled = compel(prompt)
+            neg_cond, neg_pooled = compel(negative_prompt or "")
+            cond, neg_cond = compel.pad_conditioning_tensors_to_same_length([cond, neg_cond])
+            return {
+                "prompt_embeds": cond,
+                "pooled_prompt_embeds": pooled,
+                "negative_prompt_embeds": neg_cond,
+                "negative_pooled_prompt_embeds": neg_pooled,
+            }
+        except Exception as exc:
+            self.logger.warning("compel encode failed, falling back to truncated prompt: %s", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Reference image helpers
@@ -408,7 +499,6 @@ class PipelineManager:
         pipe.set_ip_adapter_scale(strength)
 
         call_kwargs = {
-            "negative_prompt": negative_prompt or None,
             "ip_adapter_image": interpreted,
             "num_inference_steps": steps,
             "guidance_scale": guidance_scale,
@@ -416,13 +506,18 @@ class PipelineManager:
             "height": height,
             **cb_kwargs,
         }
+        embeds = self._encode_prompts(prompt, negative_prompt)
         try:
             self.logger.info(
                 "IP-Adapter (face) | scale=%.2f | interp_size=%s | "
                 "output=%sx%s",
                 strength, interpreted.size, width, height,
             )
-            images = pipe(prompt, **call_kwargs).images
+            if embeds is not None:
+                images = pipe(**embeds, **call_kwargs).images
+            else:
+                call_kwargs["negative_prompt"] = negative_prompt or None
+                images = pipe(prompt, **call_kwargs).images
             return images[0]
         except Exception as exc:
             self.logger.exception("IP-Adapter generation failed: %s", exc)
@@ -472,7 +567,6 @@ class PipelineManager:
         ref_image = self._upscale_for_clip(ref_image)
 
         call_kwargs = {
-            "negative_prompt": negative_prompt or None,
             "ip_adapter_image": ref_image,
             "num_inference_steps": steps,
             "guidance_scale": guidance_scale,
@@ -482,6 +576,7 @@ class PipelineManager:
             **cb_kwargs,
         }
 
+        embeds = self._encode_prompts(prompt, negative_prompt)
         mode_label = "face" if ref_mode == REF_MODE_FACE else "style"
         try:
             self.logger.info(
@@ -490,7 +585,11 @@ class PipelineManager:
                 mode_label, ip_scale, orig_size,
                 ref_image.size, width, height,
             )
-            images = pipe(prompt, **call_kwargs).images
+            if embeds is not None:
+                images = pipe(**embeds, **call_kwargs).images
+            else:
+                call_kwargs["negative_prompt"] = negative_prompt or None
+                images = pipe(prompt, **call_kwargs).images
             return images[0]
         except Exception as exc:
             self.logger.exception("IP-Adapter generation failed: %s", exc)
@@ -561,6 +660,50 @@ class PipelineManager:
                     f"Error: {exc}"
                 ) from exc
 
+    def _hires_pass(
+        self,
+        *,
+        base_image: Image.Image,
+        prompt: str,
+        negative_prompt: str,
+        scale: float,
+        strength: float,
+        steps: int,
+        guidance_scale: float,
+        generator,
+    ) -> Image.Image:
+        """A1111-style HiRes Fix: PIL-upscale the base image, then run a
+        low-denoise img2img pass on it. Catches the soft-detail problem at
+        20-30 steps without re-running full diffusion at high resolution."""
+        base_w, base_h = base_image.size
+        # SDXL VAE requires multiples of 8.
+        new_w = max(8, int(base_w * scale) // 8 * 8)
+        new_h = max(8, int(base_h * scale) // 8 * 8)
+        upscaled = base_image.resize((new_w, new_h), Image.LANCZOS)
+        self.logger.info(
+            "HiRes Fix | %sx%s -> %sx%s | strength=%.2f",
+            base_w, base_h, new_w, new_h, strength,
+        )
+
+        img2img_pipe = self._get_or_create_img2img_pipeline()
+        embeds = self._encode_prompts(prompt, negative_prompt)
+        call_kwargs = {
+            "image": upscaled,
+            "strength": strength,
+            "num_inference_steps": steps,
+            "guidance_scale": guidance_scale,
+            "generator": generator,
+        }
+        try:
+            if embeds is not None:
+                return img2img_pipe(**embeds, **call_kwargs).images[0]
+            call_kwargs["negative_prompt"] = negative_prompt or None
+            return img2img_pipe(prompt, **call_kwargs).images[0]
+        except Exception as exc:
+            self.logger.exception("HiRes pass failed: %s", exc)
+            # Fall back to the un-refined upscale rather than failing the whole gen.
+            return upscaled
+
     def _generate_img2img(
         self,
         *,
@@ -582,7 +725,6 @@ class PipelineManager:
         # img2img does not accept width/height directly; the output size
         # matches the input image, so the init_image is already resized.
         call_kwargs = {
-            "negative_prompt": negative_prompt or None,
             "image": init_image,
             "strength": strength,
             "num_inference_steps": steps,
@@ -591,13 +733,18 @@ class PipelineManager:
             **cb_kwargs,
         }
 
+        embeds = self._encode_prompts(prompt, negative_prompt)
         try:
             self.logger.info(
                 "Running SDXL img2img | strength=%.2f | init_size=%s",
                 strength,
                 init_image.size,
             )
-            images = img2img_pipe(prompt, **call_kwargs).images
+            if embeds is not None:
+                images = img2img_pipe(**embeds, **call_kwargs).images
+            else:
+                call_kwargs["negative_prompt"] = negative_prompt or None
+                images = img2img_pipe(prompt, **call_kwargs).images
             return images[0]
         except Exception as exc:
             self.logger.exception("Img2Img generation failed: %s", exc)
@@ -706,6 +853,9 @@ class PipelineManager:
                 pass
             self._current_ip_adapter_mode = None
 
+        # Compel holds references to the old text encoders; drop it.
+        self._compel = None
+
         for attr in ("_inpaint_pipeline", "_img2img_pipeline", "_pipeline"):
             try:
                 pipe = getattr(self, attr, None)
@@ -780,6 +930,9 @@ class PipelineManager:
         # Apply optimizations
         self._apply_optimizations(pipe)
 
+        # Default sampler (UI may override via set_sampler before each run)
+        self._apply_sampler(pipe, DEFAULT_SAMPLER)
+
         # Apply LoRA if configured
         if lora_config is not None:
             self._apply_lora(pipe, lora_config)
@@ -788,18 +941,6 @@ class PipelineManager:
 
     def _apply_optimizations(self, pipe) -> None:
         """Apply VRAM and speed optimizations to the pipeline."""
-        # DPMSolver++ Karras scheduler for sharper outputs
-        try:
-            from diffusers import DPMSolverMultistepScheduler  # type: ignore
-            pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-                pipe.scheduler.config,
-                algorithm_type="dpmsolver++",
-                use_karras_sigmas=True,
-            )
-            self.logger.info("Switched scheduler to DPMSolver++ (Karras)")
-        except Exception as exc:
-            self.logger.warning("Could not switch scheduler: %s", exc)
-
         # Attention slicing (reduces peak VRAM)
         try:
             pipe.enable_attention_slicing()
@@ -825,6 +966,75 @@ class PipelineManager:
             self.logger.info("Enabled xFormers memory-efficient attention")
         except Exception:
             self.logger.debug("xFormers not available; using default attention")
+
+    def _apply_sampler(self, pipe, sampler: str) -> None:
+        """Swap pipe.scheduler to the named sampler (in SAMPLERS table)."""
+        spec = SAMPLERS.get(sampler) or SAMPLERS[DEFAULT_SAMPLER]
+        cls_name, kwargs = spec
+        try:
+            from diffusers import (  # type: ignore
+                DPMSolverMultistepScheduler,
+                EulerAncestralDiscreteScheduler,
+                UniPCMultistepScheduler,
+            )
+            cls_map = {
+                "DPMSolverMultistepScheduler": DPMSolverMultistepScheduler,
+                "EulerAncestralDiscreteScheduler": EulerAncestralDiscreteScheduler,
+                "UniPCMultistepScheduler": UniPCMultistepScheduler,
+            }
+            cls = cls_map[cls_name]
+            pipe.scheduler = cls.from_config(pipe.scheduler.config, **kwargs)
+            if cls is DPMSolverMultistepScheduler:
+                self._patch_dpm_init_step_index(pipe.scheduler)
+            self._current_sampler = sampler
+            self.logger.info("Sampler set: %s", sampler)
+        except Exception as exc:
+            self.logger.warning("Failed to set sampler %s: %s", sampler, exc)
+
+    @staticmethod
+    def _patch_dpm_init_step_index(scheduler) -> None:
+        """Override `_init_step_index` so the first step picks the FIRST
+        occurrence of a duplicated timestep, not the second.
+
+        Diffusers' default heuristic picks index_candidates[1] when a
+        timestep appears more than once — intended for img2img mid-schedule
+        starts. With karras sigmas on certain checkpoints (Lustify), two
+        adjacent karras sigmas round to the same integer timestep, so the
+        very first t2i step starts at index 1 instead of 0. step_index then
+        overshoots by 1 across the run and the final step accesses
+        sigmas[n+1], throwing IndexError. Pipelines that need the original
+        behaviour set begin_index explicitly — we honour that path."""
+        import types
+        import torch
+
+        def _init_step_index(self, timestep):
+            if self._begin_index is not None:
+                self._step_index = self._begin_index
+                return
+            if isinstance(timestep, torch.Tensor):
+                timestep = timestep.to(self.timesteps.device)
+            candidates = (self.timesteps == timestep).nonzero()
+            if len(candidates) == 0:
+                self._step_index = len(self.timesteps) - 1
+            else:
+                self._step_index = candidates[0].item()
+
+        scheduler._init_step_index = types.MethodType(_init_step_index, scheduler)
+
+    def set_sampler(self, sampler: str) -> None:
+        """Swap the scheduler on the active pipeline; no model reload needed.
+        Cheap; safe to call before every generation."""
+        with self._lock:
+            if self._pipeline is None:
+                return
+            if self._current_sampler == sampler:
+                return
+            self._apply_sampler(self._pipeline, sampler)
+            # Img2img / inpaint pipes were built from text2img components and
+            # captured the original scheduler reference at creation time; rebind.
+            for shared in (self._img2img_pipeline, self._inpaint_pipeline):
+                if shared is not None:
+                    shared.scheduler = self._pipeline.scheduler
 
     def _apply_lora(self, pipe, lora_config: LoRAConfig) -> None:
         """Load and fuse LoRA weights into the pipeline."""
@@ -914,3 +1124,11 @@ def _lazy_import_sdxl_pipeline():
             return StableDiffusionPipeline
         except ImportError as exc:
             raise RuntimeError("Could not import a compatible diffusers pipeline: %s" % exc)
+
+
+def _lazy_import_compel():
+    try:
+        from compel import Compel, ReturnedEmbeddingsType  # type: ignore
+        return Compel, ReturnedEmbeddingsType
+    except ImportError:
+        return None, None

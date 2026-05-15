@@ -12,7 +12,15 @@ from tkinter import ttk, filedialog, messagebox
 from PIL import Image, ImageTk
 
 from .logging_utils import configure_logging
-from .pipeline_manager import LoRAConfig, PipelineManager, REF_MODE_IMG2IMG, REF_MODE_FACE, REF_MODE_STYLE
+from .pipeline_manager import (
+    LoRAConfig,
+    PipelineManager,
+    REF_MODE_IMG2IMG,
+    REF_MODE_FACE,
+    REF_MODE_STYLE,
+    SAMPLERS,
+    DEFAULT_SAMPLER,
+)
 from .settings_store import DEFAULT_MODEL_IDS, SettingsStore, UserSettings
 
 REF_MODE_LABELS = {
@@ -24,18 +32,37 @@ REF_MODE_LABELS_INV = {v: k for k, v in REF_MODE_LABELS.items()}
 
 STYLE_PRESETS: dict[str, tuple[str, str]] = {
     "Photoreal portrait": (
-        "highly detailed photorealistic portrait, 8k, ultra detailed, realistic lighting, detailed skin, sharp focus, detailed hands",
-        "cartoon, anime, illustration, low quality, blurry, deformed hands, extra fingers, missing fingers, disfigured, bad anatomy",
+        "(photorealistic:1.2) portrait, (detailed skin texture:1.3), (sharp focus:1.1), realistic lighting, 85mm, detailed hands, 8k",
+        "cartoon, anime, illustration, plastic skin, airbrushed, low quality, blurry, deformed hands, extra fingers, missing fingers, disfigured, bad anatomy",
     ),
-    "Anime": (
-        "anime illustration, clean lines, vibrant colors, highly detailed, anime style, full body, expressive pose",
-        "photorealistic, realistic skin, grainy, noisy, low quality, deformed hands, extra fingers, missing fingers, bad anatomy",
+    "Raw photo (analog)": (
+        "(raw photo:1.3), analog film grain, natural skin pores, ambient lighting, candid composition, kodak portra 400, slight chromatic aberration",
+        "(over-processed:1.2), HDR, oversaturated, plastic skin, airbrushed, cartoon, illustration, 3d render, deformed hands, bad anatomy",
+    ),
+    "Editorial film": (
+        "(editorial film style:1.2), magazine photography, soft rim lighting, shallow depth of field, 35mm grain, fashion photography composition",
+        "amateur, snapshot, harsh flash, oversaturated, plastic skin, cartoon, anime, deformed hands, bad anatomy",
     ),
     "Cinematic": (
-        "cinematic wide shot, dramatic lighting, film still, 35mm, depth of field, highly detailed, realistic hands",
+        "(cinematic wide shot:1.2), dramatic lighting, film still, 35mm, depth of field, highly detailed, realistic hands, anamorphic lens flare",
         "cartoon, anime, flat shading, low quality, noisy, deformed hands, extra fingers, missing fingers, bad anatomy",
     ),
+    "NSFW photoreal": (
+        "(raw photo:1.3), (detailed skin texture:1.3), natural body proportions, soft natural lighting, sharp focus, 8k",
+        "(plastic skin:1.2), airbrushed, cartoon, anime, illustration, 3d render, deformed hands, extra fingers, missing fingers, bad anatomy, mutated",
+    ),
+    "Anime": (
+        "(anime illustration:1.2), clean lines, vibrant colors, highly detailed, expressive pose, sharp linework",
+        "(photorealistic:1.2), realistic skin, grainy, noisy, low quality, deformed hands, extra fingers, missing fingers, bad anatomy",
+    ),
+    "Fantasy art": (
+        "(fantasy painting:1.2), epic composition, dramatic lighting, intricate detail, painterly brush strokes, vibrant palette",
+        "photograph, photorealistic, low quality, deformed hands, extra fingers, missing fingers, bad anatomy, watermark",
+    ),
 }
+
+QUALITY_BOOSTER_POS = "(masterpiece:1.2), (best quality:1.2), (highly detailed:1.1), sharp focus"
+QUALITY_BOOSTER_NEG = "(worst quality:1.4), (low quality:1.4), lowres, jpeg artifacts, watermark, signature, text, blurry"
 
 SIZE_PRESETS: list[tuple[str, tuple[int, int]]] = [
     ("Square 1024×1024", (1024, 1024)),
@@ -95,6 +122,7 @@ class PictureAIApp(tk.Tk):
         self._tk_image: Optional[ImageTk.PhotoImage] = None
         self._is_generating = False
         self._is_ai_upscaling = False
+        self._last_generation_metadata: Optional[str] = None
 
         self.model_ids = self.settings_store.load_model_ids()
         self.user_settings = self.settings_store.load_user_settings()
@@ -185,12 +213,58 @@ class PictureAIApp(tk.Tk):
             width=5,
         ).grid(row=0, column=10, sticky=tk.W)
 
+        ttk.Label(numeric_frame, text="Sampler:").grid(row=1, column=6, padx=(15, 0), sticky=tk.W, pady=(6, 0))
+        sampler_default = self.user_settings.sampler if self.user_settings.sampler in SAMPLERS else DEFAULT_SAMPLER
+        self.sampler_var = tk.StringVar(value=sampler_default)
+        self.sampler_combobox = ttk.Combobox(
+            numeric_frame,
+            textvariable=self.sampler_var,
+            values=tuple(SAMPLERS.keys()),
+            state="readonly",
+            width=18,
+        )
+        self.sampler_combobox.grid(row=1, column=7, columnspan=4, sticky=tk.W, pady=(6, 0))
+        self.sampler_combobox.bind("<<ComboboxSelected>>", lambda _e: self._save_settings())
+
         ttk.Button(top_frame, text="Performance preset", command=self._on_performance_preset).grid(row=5, column=0, pady=(10, 0), sticky=tk.W)
         self.dark_mode_var = tk.BooleanVar(value=self.user_settings.dark_mode)
         ttk.Checkbutton(top_frame, text="Dark UI", variable=self.dark_mode_var, command=self._on_theme_toggle).grid(row=5, column=1, pady=(10, 0), sticky=tk.W)
+        self.quality_booster_var = tk.BooleanVar(value=self.user_settings.quality_booster)
+        ttk.Checkbutton(
+            top_frame,
+            text="Quality booster",
+            variable=self.quality_booster_var,
+            command=self._save_settings,
+        ).grid(row=5, column=2, pady=(10, 0), sticky=tk.W)
+
+        hires_frame = ttk.Frame(top_frame)
+        hires_frame.grid(row=6, column=0, columnspan=4, pady=(8, 0), sticky=tk.W)
+        self.hires_fix_var = tk.BooleanVar(value=self.user_settings.hires_fix)
+        ttk.Checkbutton(
+            hires_frame,
+            text="HiRes Fix (two-pass)",
+            variable=self.hires_fix_var,
+            command=self._save_settings,
+        ).grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(hires_frame, text="Scale:").grid(row=0, column=1, padx=(15, 4), sticky=tk.W)
+        self.hires_scale_var = tk.DoubleVar(value=self.user_settings.hires_scale)
+        ttk.Spinbox(
+            hires_frame,
+            from_=1.10, to=2.00, increment=0.05,
+            textvariable=self.hires_scale_var, width=6,
+            command=self._save_settings,
+        ).grid(row=0, column=2, sticky=tk.W)
+        ttk.Label(hires_frame, text="Denoise:").grid(row=0, column=3, padx=(15, 4), sticky=tk.W)
+        self.hires_strength_var = tk.DoubleVar(value=self.user_settings.hires_strength)
+        ttk.Spinbox(
+            hires_frame,
+            from_=0.10, to=0.60, increment=0.05,
+            textvariable=self.hires_strength_var, width=6,
+            command=self._save_settings,
+        ).grid(row=0, column=4, sticky=tk.W)
 
         action_frame = ttk.Frame(top_frame)
-        action_frame.grid(row=6, column=0, columnspan=4, pady=(10, 0), sticky=tk.W)
+        action_frame.grid(row=7, column=0, columnspan=4, pady=(10, 0), sticky=tk.W)
 
         ttk.Button(action_frame, text="Estimate VRAM", command=self._on_estimate_vram).grid(row=0, column=0, padx=(0, 10))
         self.generate_button = ttk.Button(action_frame, text="Generate", command=self.on_generate_clicked)
@@ -203,7 +277,7 @@ class PictureAIApp(tk.Tk):
         self.save_button.grid(row=0, column=4)
 
         lora_frame = ttk.LabelFrame(top_frame, text="LoRA (optional)")
-        lora_frame.grid(row=7, column=0, columnspan=4, sticky=tk.EW, pady=(10, 0))
+        lora_frame.grid(row=8, column=0, columnspan=4, sticky=tk.EW, pady=(10, 0))
         lora_frame.columnconfigure(1, weight=1)
 
         ttk.Checkbutton(
@@ -244,10 +318,10 @@ class PictureAIApp(tk.Tk):
 
         self.progress_var = tk.IntVar(value=0)
         self.progress_bar = ttk.Progressbar(top_frame, orient=tk.HORIZONTAL, mode="determinate", variable=self.progress_var)
-        self.progress_bar.grid(row=8, column=0, columnspan=4, sticky=tk.EW, pady=(10, 0))
+        self.progress_bar.grid(row=9, column=0, columnspan=4, sticky=tk.EW, pady=(10, 0))
 
         self.status_label = ttk.Label(top_frame, text="Model not loaded", foreground="gray")
-        self.status_label.grid(row=9, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
+        self.status_label.grid(row=10, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
 
         # Reference images UI (up to 3)
         ref_frame = ttk.LabelFrame(top_frame, text="Reference images (up to 3)")
@@ -431,6 +505,10 @@ class PictureAIApp(tk.Tk):
             base_gb = 8.0
         elif model_id == "RunDiffusion/Juggernaut-XL-v9":
             base_gb = 8.5
+        elif model_id == "RunDiffusion/Juggernaut-XI-v11":
+            base_gb = 8.5
+        elif model_id == "John6666/lustify-sdxl-nsfwsfw-endgame-sdxl":
+            base_gb = 8.5
         else:
             base_gb = 7.5
         est_gb = base_gb * scale_pixels * (steps / 30) ** 0.5
@@ -458,6 +536,10 @@ class PictureAIApp(tk.Tk):
         width, height = self._clamped_dimensions()
         steps = max(10, min(100, int(self.steps_var.get() or 30)))
         seed = self._parse_seed()
+        if seed is None:
+            # Materialize a random seed so it is recoverable from saved metadata.
+            seed = random.randint(0, 2**31 - 1)
+            self.seed_var.set(str(seed))
         model_id = self.model_var.get().strip() or DEFAULT_MODEL_IDS[0]
         guidance_scale = max(1.0, min(12.0, float(self.guidance_var.get() or 4.5)))
 
@@ -472,6 +554,11 @@ class PictureAIApp(tk.Tk):
         self._save_settings()
 
         negative_prompt = self.negative_prompt_entry.get().strip()
+        if self.quality_booster_var.get():
+            prompt = f"{prompt}, {QUALITY_BOOSTER_POS}"
+            negative_prompt = (
+                f"{negative_prompt}, {QUALITY_BOOSTER_NEG}" if negative_prompt else QUALITY_BOOSTER_NEG
+            )
         lora_config = self._current_lora_config()
         reference_images = [p for p in self.reference_paths if p]
         ref_strength = max(0.1, min(1.0, float(self.ref_strength_var.get() or 0.7)))
@@ -500,10 +587,16 @@ class PictureAIApp(tk.Tk):
             )
             return
 
+        sampler = self._current_sampler_label()
+
         def worker() -> None:
             try:
                 device_info = self.pipeline_manager.ensure_pipeline(model_id, lora_config)
+                self.pipeline_manager.set_sampler(sampler)
                 self.after(0, lambda: self._set_status(f"Model ready on {device_info.description} – generating…"))
+                hires_fix = bool(self.hires_fix_var.get())
+                hires_scale = float(self.hires_scale_var.get() or 1.5)
+                hires_strength = float(self.hires_strength_var.get() or 0.35)
                 image = self.pipeline_manager.generate_image(
                     prompt=prompt,
                     negative_prompt=negative_prompt,
@@ -516,7 +609,25 @@ class PictureAIApp(tk.Tk):
                     ref_mode=ref_mode,
                     progress_callback=self._progress_callback,
                     reference_images=reference_images,
+                    hires_fix=hires_fix,
+                    hires_scale=hires_scale,
+                    hires_strength=hires_strength,
                 )
+                metadata = self._build_generation_metadata(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    width=width,
+                    height=height,
+                    steps=steps,
+                    guidance_scale=guidance_scale,
+                    seed=seed,
+                    model_id=model_id,
+                    sampler=self._current_sampler_label(),
+                    hires_fix=hires_fix,
+                    hires_scale=hires_scale,
+                    hires_strength=hires_strength,
+                )
+                self._last_generation_metadata = metadata
                 self.after(0, lambda img=image: self._finish_generation(img))
             except Exception as exc:  # pragma: no cover
                 self.logger.exception("Generation failed: %s", exc)
@@ -538,7 +649,7 @@ class PictureAIApp(tk.Tk):
         if not file_path:
             return
         try:
-            self.current_image.save(file_path)
+            self._save_image_with_metadata(self.current_image, file_path)
             self._set_status(f"Saved to {file_path}")
         except Exception as exc:  # pragma: no cover
             self.logger.exception("Save failed: %s", exc)
@@ -637,7 +748,7 @@ class PictureAIApp(tk.Tk):
     def _auto_cache_image(self, image: Image.Image) -> None:
         try:
             filename = f"image_{uuid.uuid4().hex}.png"
-            image.save(self.cache_root / filename)
+            self._save_image_with_metadata(image, str(self.cache_root / filename))
         except Exception as exc:
             self.logger.debug("Failed to auto-cache image: %s", exc)
 
@@ -681,6 +792,64 @@ class PictureAIApp(tk.Tk):
     def _set_status(self, text: str) -> None:
         self.status_label.config(text=text)
 
+    def _current_sampler_label(self) -> str:
+        """Human-readable label of the active sampler (set by the sampler picker)."""
+        var = getattr(self, "sampler_var", None)
+        if var is not None:
+            try:
+                v = var.get().strip()
+                if v:
+                    return v
+            except Exception:
+                pass
+        return "DPM++ 2M Karras"
+
+    def _build_generation_metadata(
+        self,
+        *,
+        prompt: str,
+        negative_prompt: str,
+        width: int,
+        height: int,
+        steps: int,
+        guidance_scale: float,
+        seed: int,
+        model_id: str,
+        sampler: str,
+        hires_fix: bool = False,
+        hires_scale: float = 1.5,
+        hires_strength: float = 0.35,
+    ) -> str:
+        """A1111-compatible `parameters` string for PNG embed.
+        Loadable by Automatic1111, ComfyUI metadata viewers, and re-readable
+        by this app via `image.info['parameters']`."""
+        parts: list[str] = [prompt or ""]
+        if negative_prompt:
+            parts.append(f"Negative prompt: {negative_prompt}")
+        tail = (
+            f"Steps: {steps}, Sampler: {sampler}, CFG scale: {guidance_scale}, "
+            f"Seed: {seed}, Size: {width}x{height}, Model: {model_id}"
+        )
+        if hires_fix:
+            tail += (
+                f", Hires upscale: {hires_scale}, Hires steps: {steps}, "
+                f"Denoising strength: {hires_strength}"
+            )
+        parts.append(tail)
+        return "\n".join(parts)
+
+    def _save_image_with_metadata(self, image: Image.Image, path: str) -> None:
+        """Save image; embed A1111-format `parameters` PNG tEXt chunk if PNG."""
+        suffix = Path(path).suffix.lower()
+        metadata = self._last_generation_metadata
+        if suffix in ("", ".png") and metadata:
+            from PIL import PngImagePlugin
+            pnginfo = PngImagePlugin.PngInfo()
+            pnginfo.add_text("parameters", metadata)
+            image.save(path, pnginfo=pnginfo)
+        else:
+            image.save(path)
+
     def _save_settings(self) -> None:
         settings = UserSettings(
             prompt=self.prompt_entry.get().strip(),
@@ -701,6 +870,11 @@ class PictureAIApp(tk.Tk):
             lora_preset=self.lora_preset_var.get() or LORA_PRESET_CUSTOM,
             ref_strength=float(self.ref_strength_var.get() or 0.7),
             ref_mode=REF_MODE_LABELS.get(self.ref_mode_var.get(), REF_MODE_IMG2IMG),
+            sampler=self._current_sampler_label(),
+            quality_booster=bool(self.quality_booster_var.get()),
+            hires_fix=bool(self.hires_fix_var.get()),
+            hires_scale=float(self.hires_scale_var.get() or 1.5),
+            hires_strength=float(self.hires_strength_var.get() or 0.35),
             reference_images=[p for p in self.reference_paths if p],
         )
         self.settings_store.save_user_settings(settings)
