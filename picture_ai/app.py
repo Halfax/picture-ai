@@ -21,6 +21,7 @@ from .pipeline_manager import (
     SAMPLERS,
     DEFAULT_SAMPLER,
 )
+from .model_catalog import catalog_get
 from .settings_store import DEFAULT_MODEL_IDS, SettingsStore, UserSettings
 
 REF_MODE_LABELS = {
@@ -170,8 +171,14 @@ class PictureAIApp(tk.Tk):
         self.model_combobox.bind("<<ComboboxSelected>>", self._on_model_changed)
         self._add_labeled_row(top_frame, row=3, label="Model:", widget=self.model_combobox)
 
+        # One-line tag + usage hint for the selected model (from model_catalog).
+        self.model_info_label = ttk.Label(
+            top_frame, text="", foreground="#7c7c8a", wraplength=720, justify=tk.LEFT
+        )
+        self.model_info_label.grid(row=4, column=1, columnspan=3, sticky=tk.W, padx=(5, 0), pady=(2, 0))
+
         numeric_frame = ttk.Frame(top_frame)
-        numeric_frame.grid(row=4, column=0, columnspan=4, pady=(10, 0), sticky=tk.EW)
+        numeric_frame.grid(row=5, column=0, columnspan=4, pady=(10, 0), sticky=tk.EW)
         numeric_frame.columnconfigure(11, weight=1)
 
         ttk.Label(numeric_frame, text="Steps:").grid(row=0, column=0, sticky=tk.W)
@@ -226,19 +233,24 @@ class PictureAIApp(tk.Tk):
         self.sampler_combobox.grid(row=1, column=7, columnspan=4, sticky=tk.W, pady=(6, 0))
         self.sampler_combobox.bind("<<ComboboxSelected>>", lambda _e: self._save_settings())
 
-        ttk.Button(top_frame, text="Performance preset", command=self._on_performance_preset).grid(row=5, column=0, pady=(10, 0), sticky=tk.W)
+        ttk.Button(top_frame, text="Performance preset", command=self._on_performance_preset).grid(row=6, column=0, pady=(10, 0), sticky=tk.W)
         self.dark_mode_var = tk.BooleanVar(value=self.user_settings.dark_mode)
-        ttk.Checkbutton(top_frame, text="Dark UI", variable=self.dark_mode_var, command=self._on_theme_toggle).grid(row=5, column=1, pady=(10, 0), sticky=tk.W)
+        ttk.Checkbutton(top_frame, text="Dark UI", variable=self.dark_mode_var, command=self._on_theme_toggle).grid(row=6, column=1, pady=(10, 0), sticky=tk.W)
         self.quality_booster_var = tk.BooleanVar(value=self.user_settings.quality_booster)
         ttk.Checkbutton(
             top_frame,
             text="Quality booster",
             variable=self.quality_booster_var,
             command=self._save_settings,
-        ).grid(row=5, column=2, pady=(10, 0), sticky=tk.W)
+        ).grid(row=6, column=2, pady=(10, 0), sticky=tk.W)
+        ttk.Button(
+            top_frame,
+            text="Recommended settings",
+            command=self._on_apply_recommended,
+        ).grid(row=6, column=3, pady=(10, 0), sticky=tk.W)
 
         hires_frame = ttk.Frame(top_frame)
-        hires_frame.grid(row=6, column=0, columnspan=4, pady=(8, 0), sticky=tk.W)
+        hires_frame.grid(row=7, column=0, columnspan=4, pady=(8, 0), sticky=tk.W)
         self.hires_fix_var = tk.BooleanVar(value=self.user_settings.hires_fix)
         ttk.Checkbutton(
             hires_frame,
@@ -264,7 +276,7 @@ class PictureAIApp(tk.Tk):
         ).grid(row=0, column=4, sticky=tk.W)
 
         action_frame = ttk.Frame(top_frame)
-        action_frame.grid(row=7, column=0, columnspan=4, pady=(10, 0), sticky=tk.W)
+        action_frame.grid(row=8, column=0, columnspan=4, pady=(10, 0), sticky=tk.W)
 
         ttk.Button(action_frame, text="Estimate VRAM", command=self._on_estimate_vram).grid(row=0, column=0, padx=(0, 10))
         self.generate_button = ttk.Button(action_frame, text="Generate", command=self.on_generate_clicked)
@@ -277,7 +289,7 @@ class PictureAIApp(tk.Tk):
         self.save_button.grid(row=0, column=4)
 
         lora_frame = ttk.LabelFrame(top_frame, text="LoRA (optional)")
-        lora_frame.grid(row=8, column=0, columnspan=4, sticky=tk.EW, pady=(10, 0))
+        lora_frame.grid(row=9, column=0, columnspan=4, sticky=tk.EW, pady=(10, 0))
         lora_frame.columnconfigure(1, weight=1)
 
         ttk.Checkbutton(
@@ -318,14 +330,14 @@ class PictureAIApp(tk.Tk):
 
         self.progress_var = tk.IntVar(value=0)
         self.progress_bar = ttk.Progressbar(top_frame, orient=tk.HORIZONTAL, mode="determinate", variable=self.progress_var)
-        self.progress_bar.grid(row=9, column=0, columnspan=4, sticky=tk.EW, pady=(10, 0))
+        self.progress_bar.grid(row=10, column=0, columnspan=4, sticky=tk.EW, pady=(10, 0))
 
         self.status_label = ttk.Label(top_frame, text="Model not loaded", foreground="gray")
-        self.status_label.grid(row=10, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
+        self.status_label.grid(row=11, column=0, columnspan=4, sticky=tk.W, pady=(5, 0))
 
         # Reference images UI (up to 3)
         ref_frame = ttk.LabelFrame(top_frame, text="Reference images (up to 3)")
-        ref_frame.grid(row=10, column=0, columnspan=4, sticky=tk.EW, pady=(10, 0))
+        ref_frame.grid(row=12, column=0, columnspan=4, sticky=tk.EW, pady=(10, 0))
         ref_frame.columnconfigure(0, weight=1)
 
         self.reference_paths: list[str] = ["", "", ""]
@@ -436,8 +448,10 @@ class PictureAIApp(tk.Tk):
         self._sync_lora_preset_to_fields()
         self._update_lora_controls()
 
+        self._update_model_info()
         self.width_var.trace_add("write", lambda *_: self._on_dimensions_manual_change())
         self.height_var.trace_add("write", lambda *_: self._on_dimensions_manual_change())
+        self.model_var.trace_add("write", lambda *_: self._update_model_info())
         self.lora_source_var.trace_add("write", self._on_lora_fields_changed)
         self.lora_weight_var.trace_add("write", self._on_lora_fields_changed)
         self.lora_scale_var.trace_add("write", self._on_lora_fields_changed)
@@ -489,6 +503,26 @@ class PictureAIApp(tk.Tk):
         self.guidance_var.set(4.0)
         self._save_settings()
 
+    def _update_model_info(self) -> None:
+        """Refresh the tag + usage-hint label under the model picker."""
+        label = getattr(self, "model_info_label", None)
+        if label is None:
+            return
+        info = catalog_get(self.model_var.get())
+        text = f"{info.tag} — {info.blurb}" if info.tag else info.blurb
+        label.config(text=text)
+
+    def _on_apply_recommended(self) -> None:
+        """Apply the selected model's recommended steps / CFG / sampler."""
+        info = catalog_get(self.model_var.get().strip() or DEFAULT_MODEL_IDS[0])
+        rec = info.recommended
+        self.steps_var.set(rec.steps)
+        self.guidance_var.set(rec.cfg_scale)
+        if rec.sampler in SAMPLERS:
+            self.sampler_var.set(rec.sampler)
+        self._save_settings()
+        self._set_status(f"Recommended settings for {info.label} — {rec.note}")
+
     def _on_theme_toggle(self) -> None:
         self._apply_theme(self.dark_mode_var.get())
         self._save_settings()
@@ -501,16 +535,7 @@ class PictureAIApp(tk.Tk):
 
         base_pixels = 1024 * 1024
         scale_pixels = (width * height) / base_pixels
-        if model_id == "SG161222/RealVisXL_V5.0":
-            base_gb = 8.0
-        elif model_id == "RunDiffusion/Juggernaut-XL-v9":
-            base_gb = 8.5
-        elif model_id == "RunDiffusion/Juggernaut-XI-v11":
-            base_gb = 8.5
-        elif model_id == "John6666/lustify-sdxl-nsfwsfw-endgame-sdxl":
-            base_gb = 8.5
-        else:
-            base_gb = 7.5
+        base_gb = catalog_get(model_id).vram_base_gb
         est_gb = base_gb * scale_pixels * (steps / 30) ** 0.5
         est_gb = max(3.0, min(20.0, est_gb))
 

@@ -10,6 +10,8 @@ from typing import Callable, Optional
 import numpy as np
 from PIL import Image
 
+from .model_catalog import catalog_get
+
 CallbackType = Optional[Callable[[int, int, object], None]]
 
 # Reference mode constants
@@ -93,6 +95,7 @@ class PipelineManager:
         self._current_model_id: Optional[str] = None
         self._current_lora_key: Optional[str] = None
         self._current_sampler: Optional[str] = None
+        self._current_family: str = "sdxl"
         self._current_ip_adapter_mode: Optional[str] = None
         self._device_info = DeviceInfo(kind="cpu", description="CPU", generator_device="cpu")
 
@@ -196,6 +199,26 @@ class PipelineManager:
                 progress_callback(step, 0, None),
                 cb_data,
             )[1]
+
+        # SD3 / Flux: a single text2img path. compel, IP-Adapter,
+        # reference-image blending and hires fix are SDXL-only in this build.
+        if self._current_family in ("sd3", "flux"):
+            if reference_images:
+                self.logger.warning(
+                    "%s does not support reference images here — ignoring them",
+                    self._current_family,
+                )
+            return self._generate_dit_text2img(
+                pipe=pipe,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                width=width,
+                height=height,
+                steps=steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                cb_kwargs=cb_kwargs,
+            )
 
         # Handle reference images
         if reference_images and ref_mode == REF_MODE_FACE:
@@ -704,6 +727,49 @@ class PipelineManager:
             # Fall back to the un-refined upscale rather than failing the whole gen.
             return upscaled
 
+    def _generate_dit_text2img(
+        self,
+        *,
+        pipe,
+        prompt: str,
+        negative_prompt: str,
+        width: int,
+        height: int,
+        steps: int,
+        guidance_scale: float,
+        generator,
+        cb_kwargs: dict,
+    ) -> Image.Image:
+        """Text-to-image for the DiT families (SD3 / Flux). No compel and no
+        prompt-embed path — these pipelines take the raw prompt directly."""
+        family = self._current_family
+        # Flux's VAE needs dimensions that are multiples of 16; SD3 is fine
+        # with the multiples of 8 the UI already enforces.
+        if family == "flux":
+            width = max(16, width - width % 16)
+            height = max(16, height - height % 16)
+        call_kwargs = {
+            "prompt": prompt,
+            "num_inference_steps": steps,
+            "guidance_scale": guidance_scale,
+            "width": width,
+            "height": height,
+            "generator": generator,
+            **cb_kwargs,
+        }
+        # Flux dev/schnell are guidance-distilled and take no negative prompt.
+        if family == "sd3":
+            call_kwargs["negative_prompt"] = negative_prompt or None
+        try:
+            self.logger.info(
+                "Running %s text2img | steps=%s | size=%sx%s | guidance=%.2f",
+                family, steps, width, height, guidance_scale,
+            )
+            return pipe(**call_kwargs).images[0]
+        except Exception as exc:
+            self.logger.exception("%s generation failed: %s", family, exc)
+            raise RuntimeError(f"{family} image generation failed: {exc}") from exc
+
     def _generate_img2img(
         self,
         *,
@@ -855,6 +921,7 @@ class PipelineManager:
 
         # Compel holds references to the old text encoders; drop it.
         self._compel = None
+        self._current_family = "sdxl"
 
         for attr in ("_inpaint_pipeline", "_img2img_pipeline", "_pipeline"):
             try:
@@ -876,36 +943,9 @@ class PipelineManager:
         except Exception:
             pass
 
-    def _create_pipeline(self, model_id: str, lora_config: LoRAConfig | None):
-        """Create and return an optimized SDXL pipeline."""
+    def _detect_device(self) -> None:
+        """Probe CUDA and record the result on self._device_info."""
         torch = _lazy_import_torch()
-        _SDXLPipeline = _lazy_import_sdxl_pipeline()
-
-        local_dir = self._model_dir_for_id(model_id)
-        local_dir.mkdir(parents=True, exist_ok=True)
-
-        load_kwargs = {
-            "cache_dir": str(local_dir),
-            "torch_dtype": torch.float16,
-            "variant": "fp16",
-        }
-        if self._hf_token:
-            load_kwargs["token"] = self._hf_token
-
-        # Try fp16 variant first, fall back to default dtype
-        try:
-            self.logger.info("Loading pipeline for model %s (cache=%s, fp16)", model_id, local_dir)
-            pipe = _SDXLPipeline.from_pretrained(model_id, **load_kwargs)
-        except Exception:
-            self.logger.info("fp16 variant not found, trying default precision")
-            load_kwargs.pop("variant", None)
-            try:
-                pipe = _SDXLPipeline.from_pretrained(model_id, **load_kwargs)
-            except Exception as exc:
-                self.logger.exception("Failed to load pipeline for model %s: %s", model_id, exc)
-                raise
-
-        # Determine device
         try:
             if hasattr(torch, "cuda") and torch.cuda.is_available():
                 try:
@@ -918,6 +958,73 @@ class PipelineManager:
         except Exception:
             self._device_info = DeviceInfo(kind="cpu", description="CPU", generator_device="cpu")
 
+    def _create_pipeline(self, model_id: str, lora_config: LoRAConfig | None):
+        """Create a pipeline for `model_id`, dispatching on its model family
+        (sdxl / sd3 / flux — see model_catalog)."""
+        info = catalog_get(model_id)
+        family = info.family
+        self._detect_device()
+        self.logger.info(
+            "Loading model %s | family=%s | device=%s",
+            model_id, family, self._device_info.description,
+        )
+
+        if family == "flux":
+            if lora_config is not None:
+                self.logger.warning("LoRA is not applied to Flux models in this build")
+            pipe = self._create_flux_pipeline(model_id)
+        elif family == "sd3":
+            if lora_config is not None:
+                self.logger.warning("LoRA is not applied to SD3 models in this build")
+            pipe = self._create_sd3_pipeline(model_id)
+        else:
+            pipe = self._create_sdxl_pipeline(model_id, lora_config, info.single_file)
+
+        self._current_family = family
+        return pipe
+
+    def _create_sdxl_pipeline(self, model_id: str, lora_config: LoRAConfig | None,
+                              single_file: bool):
+        """Load an optimized SDXL pipeline — either a diffusers-format repo
+        or a single-file .safetensors checkpoint — then set the default
+        sampler and apply any LoRA."""
+        torch = _lazy_import_torch()
+        _SDXLPipeline = _lazy_import_sdxl_pipeline()
+
+        local_dir = self._model_dir_for_id(model_id)
+        local_dir.mkdir(parents=True, exist_ok=True)
+
+        if single_file:
+            pipe = self._load_sdxl_single_file(_SDXLPipeline, model_id, local_dir)
+        else:
+            load_kwargs = {
+                "cache_dir": str(local_dir),
+                "torch_dtype": torch.float16,
+                "variant": "fp16",
+            }
+            if self._hf_token:
+                load_kwargs["token"] = self._hf_token
+            # Try fp16 diffusers-format; fall back to default precision, then
+            # to single-file (covers Civitai-style one-file checkpoints).
+            try:
+                self.logger.info("Loading SDXL pipeline %s (diffusers, fp16)", model_id)
+                pipe = _SDXLPipeline.from_pretrained(model_id, **load_kwargs)
+            except Exception:
+                self.logger.info("fp16 variant not found, trying default precision")
+                load_kwargs.pop("variant", None)
+                try:
+                    pipe = _SDXLPipeline.from_pretrained(model_id, **load_kwargs)
+                except Exception as exc:
+                    self.logger.info(
+                        "from_pretrained failed for %s (%s); trying single-file",
+                        model_id, exc,
+                    )
+                    try:
+                        pipe = self._load_sdxl_single_file(_SDXLPipeline, model_id, local_dir)
+                    except Exception as exc2:
+                        self.logger.exception("Failed to load SDXL model %s: %s", model_id, exc2)
+                        raise
+
         # Move to device
         try:
             pipe = pipe.to(self._device_info.generator_device)
@@ -927,17 +1034,119 @@ class PipelineManager:
             except Exception:
                 self.logger.warning("Failed to move pipeline to device; leaving as-loaded")
 
-        # Apply optimizations
         self._apply_optimizations(pipe)
-
         # Default sampler (UI may override via set_sampler before each run)
         self._apply_sampler(pipe, DEFAULT_SAMPLER)
-
-        # Apply LoRA if configured
         if lora_config is not None:
             self._apply_lora(pipe, lora_config)
-
         return pipe
+
+    def _load_sdxl_single_file(self, pipeline_cls, model_id: str, local_dir: Path):
+        """Load an SDXL pipeline from a single .safetensors checkpoint — a
+        Hugging Face repo id holding one file, a direct URL, or a local path.
+        This is what unlocks Civitai-style checkpoints (Pony, Illustrious,
+        DreamShaper, ...) that aren't published in diffusers folder format."""
+        torch = _lazy_import_torch()
+        load_kwargs = {
+            "torch_dtype": torch.float16,
+            "cache_dir": str(local_dir),
+        }
+        if self._hf_token:
+            load_kwargs["token"] = self._hf_token
+        self.logger.info("Loading SDXL pipeline %s (single-file checkpoint)", model_id)
+        return pipeline_cls.from_single_file(model_id, **load_kwargs)
+
+    def _create_sd3_pipeline(self, model_id: str):
+        """Load Stable Diffusion 3.5 (StableDiffusion3Pipeline). SD3.5 Medium
+        is ~10 GiB at fp16 and fits the 5080 directly."""
+        torch = _lazy_import_torch()
+        StableDiffusion3Pipeline = _lazy_import_sd3_pipeline()
+
+        local_dir = self._model_dir_for_id(model_id)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        load_kwargs = {
+            "cache_dir": str(local_dir),
+            "torch_dtype": torch.float16,
+        }
+        if self._hf_token:
+            load_kwargs["token"] = self._hf_token
+
+        try:
+            pipe = StableDiffusion3Pipeline.from_pretrained(model_id, **load_kwargs)
+        except Exception as exc:
+            self.logger.exception("Failed to load SD3 model %s: %s", model_id, exc)
+            raise RuntimeError(
+                f"Failed to load {model_id}. SD3.5 is gated — accept its license "
+                "on huggingface.co and put a valid token in token.txt. "
+                f"Error: {exc}"
+            ) from exc
+
+        try:
+            pipe = pipe.to(self._device_info.generator_device)
+        except Exception:
+            self.logger.warning("Failed to move SD3 pipeline to device; leaving as-loaded")
+        self._apply_dit_optimizations(pipe)
+        return pipe
+
+    def _create_flux_pipeline(self, model_id: str):
+        """Load Flux NF4-quantized so it fits 16 GB. The transformer and the
+        T5 text encoder load 4-bit; CLIP and the VAE stay full precision
+        (they're small). enable_model_cpu_offload keeps peak VRAM in budget."""
+        torch = _lazy_import_torch()
+        FluxPipeline = _lazy_import_flux_pipeline()
+        quant_config = _build_flux_quant_config(torch)
+        if quant_config is None:
+            self.logger.warning(
+                "Flux: bitsandbytes / diffusers quantization unavailable — "
+                "loading unquantized, which will likely exceed 16 GB VRAM"
+            )
+
+        local_dir = self._model_dir_for_id(model_id)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        load_kwargs = {
+            "cache_dir": str(local_dir),
+            "torch_dtype": torch.bfloat16,
+        }
+        if quant_config is not None:
+            load_kwargs["quantization_config"] = quant_config
+        if self._hf_token:
+            load_kwargs["token"] = self._hf_token
+
+        try:
+            pipe = FluxPipeline.from_pretrained(model_id, **load_kwargs)
+        except Exception as exc:
+            self.logger.exception("Failed to load Flux model %s: %s", model_id, exc)
+            raise RuntimeError(
+                f"Failed to load {model_id}. Flux is gated (accept the license "
+                "on huggingface.co) and needs `bitsandbytes` installed for "
+                f"4-bit quantization. Error: {exc}"
+            ) from exc
+
+        # With a quantized pipeline, do NOT call .to('cuda'); CPU offload
+        # streams components on demand and keeps peak residency under 16 GB.
+        try:
+            pipe.enable_model_cpu_offload()
+            self.logger.info("Flux: enabled model CPU offload")
+        except Exception as exc:
+            self.logger.warning("Flux: enable_model_cpu_offload failed: %s", exc)
+            try:
+                pipe = pipe.to(self._device_info.generator_device)
+            except Exception:
+                self.logger.warning("Flux: could not move pipeline to device")
+        self._apply_dit_optimizations(pipe)
+        return pipe
+
+    def _apply_dit_optimizations(self, pipe) -> None:
+        """VAE slicing/tiling for the DiT pipelines (SD3 / Flux). These keep
+        the VAE decode of a 1024px image inside budget; the SDXL-only tweaks
+        (DPM++ sampler swap, xformers UNet attention) do not apply here."""
+        for name, fn in (("VAE slicing", "enable_vae_slicing"),
+                         ("VAE tiling", "enable_vae_tiling")):
+            try:
+                getattr(pipe, fn)()
+                self.logger.info("Enabled %s", name)
+            except Exception:
+                pass
 
     def _apply_optimizations(self, pipe) -> None:
         """Apply VRAM and speed optimizations to the pipeline."""
@@ -1027,6 +1236,8 @@ class PipelineManager:
         with self._lock:
             if self._pipeline is None:
                 return
+            if self._current_family != "sdxl":
+                return  # SD3 / Flux keep their native flow-matching scheduler
             if self._current_sampler == sampler:
                 return
             self._apply_sampler(self._pipeline, sampler)
@@ -1132,3 +1343,54 @@ def _lazy_import_compel():
         return Compel, ReturnedEmbeddingsType
     except ImportError:
         return None, None
+
+
+def _lazy_import_sd3_pipeline():
+    try:
+        from diffusers import StableDiffusion3Pipeline  # type: ignore
+        return StableDiffusion3Pipeline
+    except ImportError as exc:
+        raise RuntimeError(
+            "StableDiffusion3Pipeline not available — upgrade diffusers: %s" % exc
+        )
+
+
+def _lazy_import_flux_pipeline():
+    try:
+        from diffusers import FluxPipeline  # type: ignore
+        return FluxPipeline
+    except ImportError as exc:
+        raise RuntimeError(
+            "FluxPipeline not available — upgrade diffusers: %s" % exc
+        )
+
+
+def _build_flux_quant_config(torch):
+    """Build a PipelineQuantizationConfig that loads the Flux transformer and
+    the T5 text encoder in 4-bit NF4. Returns None if bitsandbytes or the
+    diffusers quantization API isn't available — the caller then loads
+    unquantized (which will likely OOM on 16 GB, surfaced as a clear error)."""
+    try:
+        from diffusers import BitsAndBytesConfig as DiffusersBnB  # type: ignore
+        from transformers import BitsAndBytesConfig as TransformersBnB  # type: ignore
+        try:
+            from diffusers.quantizers import PipelineQuantizationConfig  # type: ignore
+        except Exception:
+            from diffusers import PipelineQuantizationConfig  # type: ignore
+        import bitsandbytes  # noqa: F401  — ensure the 4-bit backend is installed
+    except Exception:
+        return None
+    return PipelineQuantizationConfig(
+        quant_mapping={
+            "transformer": DiffusersBnB(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            ),
+            "text_encoder_2": TransformersBnB(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            ),
+        }
+    )

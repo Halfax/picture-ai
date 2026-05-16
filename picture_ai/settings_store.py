@@ -6,12 +6,20 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, List
 
+# Order mirrors model_catalog.MODEL_CATALOG: SDXL diffusers-format first,
+# then the single-file SDXL checkpoint, then SD3.5 and Flux.
 DEFAULT_MODEL_IDS: list[str] = [
     "stabilityai/stable-diffusion-xl-base-1.0",
     "SG161222/RealVisXL_V5.0",
     "RunDiffusion/Juggernaut-XL-v9",
     "RunDiffusion/Juggernaut-XI-v11",
     "John6666/lustify-sdxl-nsfwsfw-endgame-sdxl",
+    "Lykon/dreamshaper-xl-1-0",
+    "stabilityai/sdxl-turbo",
+    "LyliaEngine/Pony_Diffusion_V6_XL",
+    "stabilityai/stable-diffusion-3.5-medium",
+    "black-forest-labs/FLUX.1-dev",
+    "black-forest-labs/FLUX.1-schnell",
 ]
 DEFAULT_STYLE = "Photoreal portrait"
 
