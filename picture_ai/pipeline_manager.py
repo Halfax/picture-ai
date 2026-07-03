@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import logging
 import os
 import threading
@@ -111,6 +112,22 @@ class PipelineManager:
                 and self._current_lora_key == lora_key
             ):
                 return self._device_info
+
+            # Same model, different LoRA: swap the LoRA on the live pipeline
+            # instead of reloading the whole model from disk.
+            if (
+                self._pipeline is not None
+                and self._current_model_id == model_id
+                and self._current_family == "sdxl"
+            ):
+                try:
+                    self._swap_lora(self._pipeline, lora_config)
+                    self._current_lora_key = lora_key
+                    return self._device_info
+                except Exception as exc:
+                    self.logger.warning(
+                        "In-place LoRA swap failed (%s); falling back to full reload", exc
+                    )
 
             self._dispose_pipeline()
             self._pipeline = self._create_pipeline(model_id, lora_config)
@@ -510,7 +527,7 @@ class PipelineManager:
             strength=0.70,
             num_inference_steps=max(15, steps),
             guidance_scale=guidance_scale,
-            generator=generator,        # consumed here
+            generator=generator,
         ).images[0]
         self.logger.info("Interpreted character: %s", interpreted.size)
 
@@ -527,6 +544,7 @@ class PipelineManager:
             "guidance_scale": guidance_scale,
             "width": width,
             "height": height,
+            "generator": generator,
             **cb_kwargs,
         }
         embeds = self._encode_prompts(prompt, negative_prompt)
@@ -647,20 +665,6 @@ class PipelineManager:
                 load_kwargs["token"] = self._hf_token
 
             try:
-                # IP-Adapter is incompatible with SlicedAttnProcessor set by
-                # enable_attention_slicing(); undo it, then reset UNet processors.
-                try:
-                    pipe.disable_attention_slicing()
-                    self.logger.info("Disabled attention slicing for IP-Adapter compat")
-                except Exception as e1:
-                    self.logger.warning("disable_attention_slicing failed: %s", e1)
-                try:
-                    from diffusers.models.attention_processor import AttnProcessor
-                    pipe.unet.set_attn_processor(AttnProcessor())
-                    self.logger.info("Reset UNet attn processors to AttnProcessor")
-                except Exception as e2:
-                    self.logger.warning("set_attn_processor fallback failed: %s", e2)
-
                 self.logger.info(
                     "Loading IP-Adapter: %s/%s/%s",
                     IP_ADAPTER_REPO, IP_ADAPTER_SUBFOLDER, weight_name,
@@ -927,14 +931,14 @@ class PipelineManager:
             try:
                 pipe = getattr(self, attr, None)
                 if pipe is not None:
-                    try:
-                        pipe.to("cpu")
-                    except Exception:
-                        pass
                     setattr(self, attr, None)
                     del pipe
             except Exception as exc:
                 self.logger.warning("Error disposing %s: %s", attr, exc)
+
+        # Break reference cycles (compel / the shared img2img pipes held
+        # encoder refs) so the old model's VRAM is released before the next load.
+        gc.collect()
 
         # Free CUDA cache
         try:
@@ -1149,32 +1153,17 @@ class PipelineManager:
                 pass
 
     def _apply_optimizations(self, pipe) -> None:
-        """Apply VRAM and speed optimizations to the pipeline."""
-        # Attention slicing (reduces peak VRAM)
+        """Apply speed optimizations to the SDXL pipeline. On a 16 GB card
+        SDXL fp16 fits with headroom, so the low-VRAM crutches (attention
+        slicing, VAE slicing/tiling) are deliberately NOT enabled — under
+        PyTorch 2.x SDPA they only slow inference, and attention slicing
+        breaks IP-Adapter processor loading."""
+        torch = _lazy_import_torch()
         try:
-            pipe.enable_attention_slicing()
-            self.logger.info("Enabled attention slicing")
+            pipe.unet.to(memory_format=torch.channels_last)
+            self.logger.info("UNet set to channels_last memory format")
         except Exception:
             pass
-
-        # VAE slicing and tiling for lower VRAM
-        try:
-            pipe.enable_vae_slicing()
-            self.logger.info("Enabled VAE slicing")
-        except Exception:
-            pass
-        try:
-            pipe.enable_vae_tiling()
-            self.logger.info("Enabled VAE tiling")
-        except Exception:
-            pass
-
-        # xFormers memory-efficient attention (optional)
-        try:
-            pipe.enable_xformers_memory_efficient_attention()
-            self.logger.info("Enabled xFormers memory-efficient attention")
-        except Exception:
-            self.logger.debug("xFormers not available; using default attention")
 
     def _apply_sampler(self, pipe, sampler: str) -> None:
         """Swap pipe.scheduler to the named sampler (in SAMPLERS table)."""
@@ -1285,6 +1274,16 @@ class PipelineManager:
         except Exception as exc:
             self.logger.warning("Failed to load/fuse LoRA: %s", exc)
             raise
+
+    def _swap_lora(self, pipe, lora_config: LoRAConfig | None) -> None:
+        """Replace (or remove) the fused LoRA on a live SDXL pipeline
+        without reloading the base weights."""
+        if self._current_lora_key is not None:
+            pipe.unfuse_lora()
+            pipe.unload_lora_weights()
+            self.logger.info("Unfused previous LoRA")
+        if lora_config is not None:
+            self._apply_lora(pipe, lora_config)
 
     def _create_upscale_pipeline(self):
         """Create the SD x4 upscaler pipeline."""

@@ -116,6 +116,7 @@ class PictureAIApp(tk.Tk):
 
         self.cache_root = Path.cwd() / "image_cache"
         self.cache_root.mkdir(parents=True, exist_ok=True)
+        self._prune_image_cache()
 
         self.lora_presets = self._load_lora_presets()
 
@@ -124,6 +125,7 @@ class PictureAIApp(tk.Tk):
         self._is_generating = False
         self._is_ai_upscaling = False
         self._last_generation_metadata: Optional[str] = None
+        self._progress_total = 30
 
         self.model_ids = self.settings_store.load_model_ids()
         self.user_settings = self.settings_store.load_user_settings()
@@ -576,6 +578,7 @@ class PictureAIApp(tk.Tk):
         self._set_status("Preparing model…")
         self.progress_bar.config(maximum=steps)
         self.progress_var.set(0)
+        self._progress_total = steps
         self._save_settings()
 
         negative_prompt = self.negative_prompt_entry.get().strip()
@@ -725,7 +728,8 @@ class PictureAIApp(tk.Tk):
 
     # ------------------------------------------------------------------
     def _progress_callback(self, step: int, _timestep: int, _latents: object) -> None:
-        total = max(1, int(self.steps_var.get() or 30))
+        # Runs on the diffusers worker thread — don't touch Tk vars here.
+        total = max(1, self._progress_total)
         current = max(0, min(total, step + 1))
         self.after(0, lambda c=current, t=total: self._update_progress(c, t))
 
@@ -770,6 +774,27 @@ class PictureAIApp(tk.Tk):
             self._update_lora_controls()
 
     # ------------------------------------------------------------------
+    def _prune_image_cache(self, max_files: int = 500) -> None:
+        """Cap the auto-cache: keep the newest `max_files` PNGs, delete the rest."""
+        try:
+            files = sorted(
+                self.cache_root.glob("image_*.png"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            stale = files[max_files:]
+            for path in stale:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+            if stale:
+                self.logger.info(
+                    "Pruned %d old cached images (cap %d)", len(stale), max_files
+                )
+        except Exception as exc:
+            self.logger.debug("Image cache prune failed: %s", exc)
+
     def _auto_cache_image(self, image: Image.Image) -> None:
         try:
             filename = f"image_{uuid.uuid4().hex}.png"
