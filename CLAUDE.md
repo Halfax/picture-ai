@@ -18,6 +18,50 @@ Code does not port verbatim between them. The `betelgeuse` branch's model
 registry *metadata* was ported into `main`'s `model_catalog.py`; its Vulkan
 backend, sd-server and q8_0 quantization were not (different substrate).
 
+## Headless / programmatic use (no GUI) — VERIFIED 2026-07-06, don't re-derive
+
+There is **no server/API** — but you don't need the Tkinter GUI to generate.
+Drive `PipelineManager` directly. This exact recipe was verified on UYScuti /
+RTX 5080 (Juggernaut-XL-v9, 768², 8 steps, generated in seconds):
+
+```python
+import sys
+from pathlib import Path
+ROOT = Path(r"C:\Users\arhal_iz5093n\Desktop\projects\picture-ai")
+sys.path.insert(0, str(ROOT))                        # needed when run from scripts/
+from picture_ai.pipeline_manager import PipelineManager, REF_MODE_IMG2IMG
+
+pm = PipelineManager(models_root=ROOT / "models_cache")
+pm.ensure_pipeline("RunDiffusion/Juggernaut-XL-v9", None)   # loads from cache, OFFLINE, CUDA
+img = pm.generate_image(                              # -> PIL.Image
+    prompt="...", negative_prompt="...",
+    width=1024, height=1024, steps=25, guidance_scale=5.0, seed=7,
+    # img2img (SDXL only): pass an init image and how much to keep
+    # reference_images=[r"path\to\init.png"], ref_mode=REF_MODE_IMG2IMG, strength=0.5,
+)
+img.save(ROOT / "outputs" / "foo.png")
+```
+
+Run with the **venv python directly** — the console-script wrappers (`pip.exe`,
+etc.) are stale (venv was made under the old name `picutreai`):
+
+```
+venv\Scripts\python.exe scripts\your_script.py
+```
+
+- **Locally cached models** (offline; pass the HF id, it maps to
+  `models_cache/<id with "/"→"__">`): `RunDiffusion/Juggernaut-XL-v9`,
+  `RunDiffusion/Juggernaut-XI-v11`, `SG161222/RealVisXL_V5.0`,
+  `stabilityai/stable-diffusion-xl-base-1.0`, `John6666/lustify-sdxl-...`
+  (uncensored), `runwayml/stable-diffusion-v1-5`,
+  `stabilityai/stable-diffusion-3.5-medium`.
+- **img2img / reference** is SDXL-only: `reference_images=[path]` +
+  `ref_mode=REF_MODE_IMG2IMG` + `strength` (~0.3 keeps the init, ~0.8 mostly
+  new). Ideal for texture projection (feed a rendered view, refine to photoreal).
+- **SDXL native res is 1024** — 512 looks bad; use 768–1024. 5080/16 GB fits
+  SDXL fp16 with headroom. ~25 steps @ CFG 5 for quality, 8 steps for a smoke test.
+- Reusable smoke test lives at `scripts/headless_test.py`.
+
 ## Architecture as it stands
 
 - **`pipeline_manager.py` is family-aware.** `_create_pipeline` reads the
