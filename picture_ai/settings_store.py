@@ -20,6 +20,7 @@ DEFAULT_MODEL_IDS: list[str] = [
     "stabilityai/stable-diffusion-3.5-medium",
     "black-forest-labs/FLUX.1-dev",
     "black-forest-labs/FLUX.1-schnell",
+    "Lightricks/LTX-Video",
 ]
 DEFAULT_STYLE = "Photoreal portrait"
 
@@ -49,6 +50,15 @@ class UserSettings:
     hires_fix: bool = False
     hires_scale: float = 1.5
     hires_strength: float = 0.35
+    # Video-family settings. Only read when the selected model is a video
+    # model; harmless on an image model. New fields need a default so an
+    # older settings.json (written before video existed) still loads — the
+    # store merges saved values over these defaults.
+    video_seconds: float = 4.0
+    video_codec: str = "auto"
+    video_quality: int = 18
+    video_width: int = 704
+    video_height: int = 480
     # Up to 3 reference image paths (local file paths). Empty list by default.
     reference_images: list[str] = None
 

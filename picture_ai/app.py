@@ -20,9 +20,11 @@ from .pipeline_manager import (
     REF_MODE_STYLE,
     SAMPLERS,
     DEFAULT_SAMPLER,
+    _round_frame_count,
 )
-from .model_catalog import catalog_get
+from .model_catalog import catalog_get, is_video_model
 from .settings_store import DEFAULT_MODEL_IDS, SettingsStore, UserSettings
+from .video_export import DEFAULT_QUALITY, available_encoders, encode_video
 
 REF_MODE_LABELS = {
     "Img2Img (Regenerate)": REF_MODE_IMG2IMG,
@@ -127,8 +129,28 @@ class PictureAIApp(tk.Tk):
         self._last_generation_metadata: Optional[str] = None
         self._progress_total = 30
 
+        # Video state. `_clip_photos` holds pre-scaled PhotoImages for every
+        # frame: building them once up front is what makes playback smooth —
+        # converting a PIL frame per tick cannot keep 24 fps in Tk. A
+        # reference to each must be retained or Tk garbage-collects the image
+        # out from under the label and the preview goes blank.
+        self.current_clip = None
+        self._clip_photos: list[ImageTk.PhotoImage] = []
+        self._clip_index = 0
+        self._is_playing = False
+        self._play_job: Optional[str] = None
+        self._is_video_mode = False
+
         self.model_ids = self.settings_store.load_model_ids()
         self.user_settings = self.settings_store.load_user_settings()
+
+        # Image and video want very different resolutions (1024² vs 704x480),
+        # so the two sizes are tracked separately and each mode restores its
+        # own. Persisted as width/height and video_width/video_height; whichever
+        # mode is inactive keeps its remembered value rather than being
+        # overwritten by the active one.
+        self._image_size = (self.user_settings.width, self.user_settings.height)
+        self._video_size = (self.user_settings.video_width, self.user_settings.video_height)
 
         self._is_applying_size_preset = False
         self._is_applying_lora_preset = False
@@ -166,6 +188,22 @@ class PictureAIApp(tk.Tk):
         self.style_combobox["values"] = tuple(STYLE_PRESETS.keys())
         self.style_combobox.bind("<<ComboboxSelected>>", self._on_style_preset_changed)
         self._add_labeled_row(top_frame, row=2, label="Style preset:", widget=self.style_combobox)
+
+        # Output mode. This is the discoverable entry point to video: without
+        # it, video existed only as one more entry in a 12-long model dropdown
+        # with nothing marking it as different, so there was no way to find it
+        # without already knowing. Picking a mode filters the model list.
+        mode_frame = ttk.Frame(top_frame)
+        mode_frame.grid(row=2, column=2, columnspan=2, sticky=tk.W, padx=(15, 0), pady=(5, 0))
+        ttk.Label(mode_frame, text="Output:").pack(side=tk.LEFT)
+        self.output_mode_var = tk.StringVar(value="Image")
+        self._syncing_output_mode = False
+        for label in ("Image", "Video"):
+            ttk.Radiobutton(
+                mode_frame, text=label, value=label,
+                variable=self.output_mode_var,
+                command=self._on_output_mode_selected,
+            ).pack(side=tk.LEFT, padx=(8, 0))
 
         self.model_var = tk.StringVar(value=self.user_settings.model_id)
         self.model_combobox = ttk.Combobox(top_frame, textvariable=self.model_var, state="normal")
@@ -253,6 +291,7 @@ class PictureAIApp(tk.Tk):
 
         hires_frame = ttk.Frame(top_frame)
         hires_frame.grid(row=7, column=0, columnspan=4, pady=(8, 0), sticky=tk.W)
+        self.hires_frame = hires_frame
         self.hires_fix_var = tk.BooleanVar(value=self.user_settings.hires_fix)
         ttk.Checkbutton(
             hires_frame,
@@ -277,6 +316,48 @@ class PictureAIApp(tk.Tk):
             command=self._save_settings,
         ).grid(row=0, column=4, sticky=tk.W)
 
+        # Video controls share row 7 with the HiRes controls: the two modes are
+        # mutually exclusive, so _update_mode_controls() grids one and
+        # grid_remove()s the other rather than renumbering the whole layout.
+        video_frame = ttk.LabelFrame(top_frame, text="Video")
+        video_frame.grid(row=7, column=0, columnspan=4, pady=(8, 0), sticky=tk.EW)
+        self.video_frame = video_frame
+
+        ttk.Label(video_frame, text="Length (s):").grid(row=0, column=0, sticky=tk.W, padx=(5, 4))
+        self.video_seconds_var = tk.DoubleVar(value=self.user_settings.video_seconds)
+        ttk.Spinbox(
+            video_frame, from_=0.5, to=10.0, increment=0.5,
+            textvariable=self.video_seconds_var, width=6,
+            command=self._on_video_length_changed,
+        ).grid(row=0, column=1, sticky=tk.W)
+        self.video_seconds_var.trace_add("write", lambda *_: self._on_video_length_changed())
+
+        self.video_frames_label = ttk.Label(video_frame, text="", foreground="#7c7c8a")
+        self.video_frames_label.grid(row=0, column=2, sticky=tk.W, padx=(12, 0))
+
+        ttk.Label(video_frame, text="Codec:").grid(row=1, column=0, sticky=tk.W, padx=(5, 4), pady=(6, 5))
+        self.video_codec_var = tk.StringVar(value=self.user_settings.video_codec)
+        codec_choices = ["auto"] + [
+            c for c in ("h264_nvenc", "hevc_nvenc", "av1_nvenc", "libx264")
+            if c in available_encoders()
+        ]
+        self.video_codec_combo = ttk.Combobox(
+            video_frame, textvariable=self.video_codec_var, values=codec_choices,
+            state="readonly", width=12,
+        )
+        self.video_codec_combo.grid(row=1, column=1, sticky=tk.W, pady=(6, 5))
+        self.video_codec_combo.bind("<<ComboboxSelected>>", lambda _e: self._save_settings())
+
+        ttk.Label(video_frame, text="Quality (lower=better):").grid(
+            row=1, column=2, sticky=tk.W, padx=(12, 4), pady=(6, 5)
+        )
+        self.video_quality_var = tk.IntVar(value=self.user_settings.video_quality)
+        ttk.Spinbox(
+            video_frame, from_=1, to=51, increment=1,
+            textvariable=self.video_quality_var, width=5,
+            command=self._save_settings,
+        ).grid(row=1, column=3, sticky=tk.W, pady=(6, 5))
+
         action_frame = ttk.Frame(top_frame)
         action_frame.grid(row=8, column=0, columnspan=4, pady=(10, 0), sticky=tk.W)
 
@@ -289,10 +370,15 @@ class PictureAIApp(tk.Tk):
         self.ai_upscale_button.grid(row=0, column=3, padx=(0, 10))
         self.save_button = ttk.Button(action_frame, text="Save Image", command=self.on_save_clicked, state=tk.DISABLED)
         self.save_button.grid(row=0, column=4)
+        self.save_video_button = ttk.Button(
+            action_frame, text="Save Video", command=self.on_save_video_clicked, state=tk.DISABLED
+        )
+        self.save_video_button.grid(row=0, column=5, padx=(10, 0))
 
         lora_frame = ttk.LabelFrame(top_frame, text="LoRA (optional)")
         lora_frame.grid(row=9, column=0, columnspan=4, sticky=tk.EW, pady=(10, 0))
         lora_frame.columnconfigure(1, weight=1)
+        self.lora_frame = lora_frame
 
         ttk.Checkbutton(
             lora_frame,
@@ -341,6 +427,7 @@ class PictureAIApp(tk.Tk):
         ref_frame = ttk.LabelFrame(top_frame, text="Reference images (up to 3)")
         ref_frame.grid(row=12, column=0, columnspan=4, sticky=tk.EW, pady=(10, 0))
         ref_frame.columnconfigure(0, weight=1)
+        self.ref_frame = ref_frame
 
         self.reference_paths: list[str] = ["", "", ""]
         self._ref_thumb_imgs: list[Optional[ImageTk.PhotoImage]] = [None, None, None]
@@ -393,6 +480,20 @@ class PictureAIApp(tk.Tk):
 
         self.image_label = ttk.Label(image_frame, text="No image yet", anchor=tk.CENTER)
         self.image_label.pack(fill=tk.BOTH, expand=True)
+
+        # Playback strip. Tk has no video widget, so the preview is the frame
+        # sequence cycled through the same label at the model's fps — which is
+        # all a "video preview" needs to be here, and it costs no dependency.
+        # Packed only while a clip is loaded.
+        self.playback_frame = ttk.Frame(image_frame)
+        self.play_button = ttk.Button(self.playback_frame, text="Play", command=self.on_play_pause, width=7)
+        self.play_button.pack(side=tk.LEFT)
+        self.frame_scale = ttk.Scale(
+            self.playback_frame, from_=0, to=1, orient=tk.HORIZONTAL, command=self._on_scrub
+        )
+        self.frame_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(10, 10))
+        self.frame_counter_label = ttk.Label(self.playback_frame, text="", width=22)
+        self.frame_counter_label.pack(side=tk.LEFT)
 
     def _update_ref_mode_hint(self) -> None:
         """Update the hint text next to the strength spinner based on selected mode."""
@@ -451,9 +552,16 @@ class PictureAIApp(tk.Tk):
         self._update_lora_controls()
 
         self._update_model_info()
+        # Start in the mode the saved model implies. initial=True: this is a
+        # boot, not a mode switch, so nothing is remembered or overwritten.
+        self._update_mode_controls(initial=True)
+        if not self._is_video_mode:
+            self.video_frame.grid_remove()
         self.width_var.trace_add("write", lambda *_: self._on_dimensions_manual_change())
         self.height_var.trace_add("write", lambda *_: self._on_dimensions_manual_change())
         self.model_var.trace_add("write", lambda *_: self._update_model_info())
+        # Typing a model id (not just picking one) must also switch modes.
+        self.model_var.trace_add("write", lambda *_: self._update_mode_controls())
         self.lora_source_var.trace_add("write", self._on_lora_fields_changed)
         self.lora_weight_var.trace_add("write", self._on_lora_fields_changed)
         self.lora_scale_var.trace_add("write", self._on_lora_fields_changed)
@@ -491,6 +599,7 @@ class PictureAIApp(tk.Tk):
 
     def _on_model_changed(self, _event=None) -> None:
         self._set_status("Model changed – will load on next run…")
+        self._update_mode_controls()
         self._save_settings()
 
     def _on_random_seed(self) -> None:
@@ -571,10 +680,24 @@ class PictureAIApp(tk.Tk):
         guidance_scale = max(1.0, min(12.0, float(self.guidance_var.get() or 4.5)))
 
         self.model_ids = self.settings_store.ensure_model_id(self.model_ids, model_id)
-        self.model_combobox["values"] = tuple(self.model_ids)
+        # Keep the dropdown filtered to the current output mode — assigning the
+        # full list here would quietly undo the Image/Video narrowing.
+        self._sync_output_mode_to_model()
 
         self._is_generating = True
         self._toggle_generation_controls(disabled=True)
+
+        if is_video_model(model_id):
+            self._save_settings()
+            self._start_video_generation(
+                prompt=prompt,
+                model_id=model_id,
+                steps=steps,
+                seed=seed,
+                guidance_scale=guidance_scale,
+            )
+            return
+
         self._set_status("Preparing model…")
         self.progress_bar.config(maximum=steps)
         self.progress_var.set(0)
@@ -752,6 +875,294 @@ class PictureAIApp(tk.Tk):
         self._set_status("Generation failed")
         self._toggle_generation_controls(disabled=False)
 
+    # ------------------------------------------------------------------
+    # Video
+    # ------------------------------------------------------------------
+    def _models_of_kind(self, video: bool) -> list[str]:
+        return [m for m in self.model_ids if is_video_model(m) == video]
+
+    def _on_output_mode_selected(self) -> None:
+        """User picked Image or Video. Narrow the model list to that kind and,
+        if the current model is the wrong kind, move to one that isn't —
+        otherwise the radio would claim a mode the loaded model can't do."""
+        if self._syncing_output_mode:
+            return
+        want_video = self.output_mode_var.get() == "Video"
+        candidates = self._models_of_kind(want_video)
+        if not candidates:
+            messagebox.showinfo(
+                "No models",
+                "No video models are configured."
+                if want_video else "No image models are configured.",
+            )
+            self._sync_output_mode_to_model()
+            return
+        self.model_combobox["values"] = tuple(candidates)
+        if is_video_model(self.model_var.get().strip()) != want_video:
+            self.model_var.set(candidates[0])
+        self._update_mode_controls()
+        self._save_settings()
+
+    def _sync_output_mode_to_model(self) -> None:
+        """Keep the radio honest when the model is changed directly (typed or
+        picked), without re-entering _on_output_mode_selected."""
+        self._syncing_output_mode = True
+        try:
+            video = is_video_model(self.model_var.get().strip() or DEFAULT_MODEL_IDS[0])
+            self.output_mode_var.set("Video" if video else "Image")
+            self.model_combobox["values"] = tuple(self._models_of_kind(video))
+        finally:
+            self._syncing_output_mode = False
+
+    def _update_mode_controls(self, *, initial: bool = False) -> None:
+        """Show the controls that belong to the selected model's family.
+
+        Video and still models share the prompt, size, steps, CFG and seed
+        widgets; everything else differs. Rather than leaving image-only
+        controls live and silently ignoring them at generate time (the failure
+        mode where the UI implies something it won't do), the ones that don't
+        apply are removed from the layout.
+
+        `initial=True` means "the app booted in this mode", which is NOT a
+        transition: there is no outgoing size to remember, and treating it as
+        one captured the *video* dimensions as the remembered image size and
+        made the image mode restore 704x480 forever after.
+        """
+        video = is_video_model(self.model_var.get().strip() or DEFAULT_MODEL_IDS[0])
+        self._sync_output_mode_to_model()
+        if video == self._is_video_mode and not initial:
+            return
+        was_video = self._is_video_mode
+        self._is_video_mode = video
+        self.generate_button.config(text="Generate Video" if video else "Generate")
+
+        if not initial:
+            # Remember the size the mode we are leaving was using.
+            outgoing = (self.width_var.get(), self.height_var.get())
+            if was_video:
+                self._video_size = outgoing
+            else:
+                self._image_size = outgoing
+
+        if video:
+            self.hires_frame.grid_remove()
+            self.video_frame.grid()
+            if not initial:
+                self.width_var.set(self._video_size[0])
+                self.height_var.set(self._video_size[1])
+            # LoRA, reference images and the sampler picker are SDXL-only.
+            for widget in (self.lora_frame, self.ref_frame):
+                widget.grid_remove()
+            self.sampler_combobox.config(state=tk.DISABLED)
+            self._on_video_length_changed()
+        else:
+            self.video_frame.grid_remove()
+            self.hires_frame.grid()
+            if not initial:
+                self.width_var.set(self._image_size[0])
+                self.height_var.set(self._image_size[1])
+            for widget in (self.lora_frame, self.ref_frame):
+                widget.grid()
+            self.sampler_combobox.config(state="readonly")
+        self._update_model_info()
+
+    def _on_video_length_changed(self) -> None:
+        """Show the frame count the model will actually use — it snaps to a
+        legal value (8k+1 for LTX), so the seconds spinner alone would imply a
+        precision the model doesn't have."""
+        label = getattr(self, "video_frames_label", None)
+        if label is None:
+            return
+        info = catalog_get(self.model_var.get().strip() or DEFAULT_MODEL_IDS[0])
+        spec = info.video
+        if spec is None:
+            return
+        try:
+            seconds = float(self.video_seconds_var.get() or 4.0)
+        except Exception:
+            seconds = 4.0
+        frames = _round_frame_count(spec, max(1, round(seconds * spec.fps)))
+        label.config(
+            text=f"= {frames} frames @ {spec.fps} fps ({frames / spec.fps:.2f}s actual)"
+        )
+
+    def _start_video_generation(
+        self, *, prompt: str, model_id: str, steps: int, seed: int, guidance_scale: float
+    ) -> None:
+        width, height = self._clamped_dimensions()
+        negative_prompt = self.negative_prompt_entry.get().strip()
+        # Deliberately NOT applying the quality booster: its tags are compel
+        # weighted-prompt syntax ("(masterpiece:1.2)") aimed at SDXL's CLIP
+        # encoders. LTX conditions on T5, which reads that as literal text.
+        try:
+            seconds = float(self.video_seconds_var.get() or 4.0)
+        except Exception:
+            seconds = 4.0
+        codec = self.video_codec_var.get() or "auto"
+        quality = int(self.video_quality_var.get() or DEFAULT_QUALITY)
+        spec = catalog_get(model_id).video
+        num_frames = _round_frame_count(spec, max(1, round(seconds * spec.fps)))
+
+        self._stop_playback()
+        self._set_status(f"Preparing {catalog_get(model_id).label}…")
+        self.progress_bar.config(maximum=steps)
+        self.progress_var.set(0)
+        self._progress_total = steps
+
+        def worker() -> None:
+            try:
+                device_info = self.pipeline_manager.ensure_pipeline(model_id, None)
+                self.after(0, lambda: self._set_status(
+                    f"Model ready on {device_info.description} — generating "
+                    f"{num_frames} frames…"
+                ))
+                clip = self.pipeline_manager.generate_video(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    width=width,
+                    height=height,
+                    num_frames=num_frames,
+                    steps=steps,
+                    guidance_scale=guidance_scale,
+                    seed=seed,
+                    progress_callback=self._progress_callback,
+                )
+                self._last_generation_metadata = self._build_generation_metadata(
+                    prompt=prompt,
+                    negative_prompt=negative_prompt,
+                    width=clip.width,
+                    height=clip.height,
+                    steps=steps,
+                    guidance_scale=guidance_scale,
+                    seed=seed,
+                    model_id=model_id,
+                    sampler="(flow matching)",
+                    hires_fix=False,
+                    hires_scale=1.0,
+                    hires_strength=0.0,
+                )
+                self.after(0, lambda c=clip, cd=codec, q=quality: self._finish_video_generation(c, cd, q))
+            except Exception as exc:  # pragma: no cover
+                self.logger.exception("Video generation failed: %s", exc)
+                self.after(0, lambda e=exc: self._fail_generation(e))
+            finally:
+                self._is_generating = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_video_generation(self, clip, codec: str, quality: int) -> None:
+        self.current_clip = clip
+        self._video_codec_used = codec
+        self._video_quality_used = quality
+        # Frame 0 doubles as `current_image` so Save Image / upscale keep
+        # working on a still pulled out of the clip.
+        self.current_image = clip.frames[0]
+        self._prepare_clip_photos(clip)
+        self.progress_var.set(self.progress_bar["maximum"])
+        self._set_status(
+            f"Generated {len(clip.frames)} frames — {clip.duration:.2f}s @ {clip.fps} fps, "
+            f"{clip.width}x{clip.height}. Save Video to encode."
+        )
+        self._toggle_generation_controls(disabled=False)
+        self._show_frame(0)
+        self.on_play_pause()  # autoplay: the point of a clip is the motion
+
+    def _prepare_clip_photos(self, clip) -> None:
+        """Pre-scale every frame to a PhotoImage once. Doing this per tick
+        cannot keep up with 24 fps in Tk, and the references must be held or
+        Tk collects them and the label goes blank."""
+        max_w, max_h = 768, 512
+        w, h = clip.frames[0].size
+        scale = min(max_w / w, max_h / h, 1.0)
+        size = (int(w * scale), int(h * scale))
+        self._clip_photos = [
+            ImageTk.PhotoImage(f.resize(size, Image.LANCZOS)) for f in clip.frames
+        ]
+        self.frame_scale.config(to=max(0, len(self._clip_photos) - 1))
+        self.playback_frame.pack(fill=tk.X, pady=(8, 0))
+
+    def _show_frame(self, index: int) -> None:
+        if not self._clip_photos:
+            return
+        index = max(0, min(len(self._clip_photos) - 1, int(index)))
+        self._clip_index = index
+        self.image_label.config(image=self._clip_photos[index], text="")
+        clip = self.current_clip
+        if clip is not None:
+            self.frame_counter_label.config(
+                text=f"frame {index + 1}/{len(self._clip_photos)}  "
+                     f"({index / clip.fps:.2f}s)"
+            )
+
+    def _on_scrub(self, value: str) -> None:
+        if not self._clip_photos:
+            return
+        index = int(float(value))
+        if index != self._clip_index:
+            self._stop_playback()
+            self._show_frame(index)
+
+    def on_play_pause(self) -> None:
+        if not self._clip_photos:
+            return
+        if self._is_playing:
+            self._stop_playback()
+        else:
+            self._is_playing = True
+            self.play_button.config(text="Pause")
+            self._tick()
+
+    def _stop_playback(self) -> None:
+        self._is_playing = False
+        if self._play_job is not None:
+            try:
+                self.after_cancel(self._play_job)
+            except Exception:
+                pass
+            self._play_job = None
+        if hasattr(self, "play_button"):
+            self.play_button.config(text="Play")
+
+    def _tick(self) -> None:
+        if not self._is_playing or not self._clip_photos:
+            return
+        index = (self._clip_index + 1) % len(self._clip_photos)
+        self._show_frame(index)
+        self.frame_scale.set(index)
+        fps = self.current_clip.fps if self.current_clip else 24
+        self._play_job = self.after(max(1, int(1000 / max(1, fps))), self._tick)
+
+    def on_save_video_clicked(self) -> None:
+        if self.current_clip is None:
+            messagebox.showinfo("No Video", "Generate a video first.")
+            return
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".mp4",
+            filetypes=[("MP4", "*.mp4"), ("Matroska", "*.mkv"), ("All Files", "*.*")],
+        )
+        if not file_path:
+            return
+        codec = getattr(self, "_video_codec_used", "auto")
+        quality = getattr(self, "_video_quality_used", DEFAULT_QUALITY)
+        self._set_status("Encoding…")
+        self.save_video_button.config(state=tk.DISABLED)
+
+        def worker() -> None:
+            try:
+                encode_video(
+                    self.current_clip.frames, file_path,
+                    fps=self.current_clip.fps, codec=codec, quality=quality,
+                )
+                self.after(0, lambda: self._set_status(f"Saved to {file_path}"))
+            except Exception as exc:
+                self.logger.exception("Encode failed: %s", exc)
+                self.after(0, lambda e=exc: messagebox.showerror("Encode Error", str(e)))
+                self.after(0, lambda: self._set_status("Encode failed"))
+            finally:
+                self.after(0, lambda: self.save_video_button.config(state=tk.NORMAL))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def _finish_upscale(self, image: Image.Image) -> None:
         self.current_image = image
         self._auto_cache_image(image)
@@ -770,7 +1181,10 @@ class PictureAIApp(tk.Tk):
         self.save_button.config(state=tk.NORMAL if (self.current_image and not disabled) else tk.DISABLED)
         self.upscale_button.config(state=tk.NORMAL if (self.current_image and not disabled) else tk.DISABLED)
         self.ai_upscale_button.config(state=tk.NORMAL if (self.current_image and not disabled) else tk.DISABLED)
-        if not disabled:
+        self.save_video_button.config(
+            state=tk.NORMAL if (self.current_clip is not None and not disabled) else tk.DISABLED
+        )
+        if not disabled and not self._is_video_mode:
             self._update_lora_controls()
 
     # ------------------------------------------------------------------
@@ -803,6 +1217,14 @@ class PictureAIApp(tk.Tk):
             self.logger.debug("Failed to auto-cache image: %s", exc)
 
     def _update_image_preview(self) -> None:
+        # Showing a still supersedes any loaded clip — stop playback and take
+        # the transport controls away, or Play would animate frames that no
+        # longer match what is on screen.
+        self._stop_playback()
+        if self.current_clip is not None:
+            self.current_clip = None
+            self._clip_photos = []
+            self.playback_frame.pack_forget()
         if self.current_image is None:
             self.image_label.config(text="No image", image="")
             return
@@ -904,8 +1326,11 @@ class PictureAIApp(tk.Tk):
         settings = UserSettings(
             prompt=self.prompt_entry.get().strip(),
             negative_prompt=self.negative_prompt_entry.get().strip(),
-            width=int(self.width_var.get() or 1024),
-            height=int(self.height_var.get() or 1024),
+            # In video mode the live width/height belong to the VIDEO; writing
+            # them into width/height would destroy the remembered image size
+            # (and vice versa), which is what made the app boot at 704x480.
+            width=(self._image_size[0] if self._is_video_mode else int(self.width_var.get() or 1024)),
+            height=(self._image_size[1] if self._is_video_mode else int(self.height_var.get() or 1024)),
             steps=int(self.steps_var.get() or 30),
             guidance_scale=float(self.guidance_var.get() or 4.5),
             style=self.style_var.get() or next(iter(STYLE_PRESETS)),
@@ -926,10 +1351,22 @@ class PictureAIApp(tk.Tk):
             hires_scale=float(self.hires_scale_var.get() or 1.5),
             hires_strength=float(self.hires_strength_var.get() or 0.35),
             reference_images=[p for p in self.reference_paths if p],
+            video_seconds=float(self.video_seconds_var.get() or 4.0),
+            video_codec=self.video_codec_var.get() or "auto",
+            video_quality=int(self.video_quality_var.get() or DEFAULT_QUALITY),
+            # Mirror image of the above: the video size only comes from the
+            # live widgets while video mode is actually active.
+            video_width=(
+                int(self.width_var.get() or 704) if self._is_video_mode else self._video_size[0]
+            ),
+            video_height=(
+                int(self.height_var.get() or 480) if self._is_video_mode else self._video_size[1]
+            ),
         )
         self.settings_store.save_user_settings(settings)
 
     def _on_close(self) -> None:
+        self._stop_playback()
         self._save_settings()
         self.destroy()
 

@@ -11,7 +11,7 @@ from typing import Callable, Optional
 import numpy as np
 from PIL import Image
 
-from .model_catalog import catalog_get
+from .model_catalog import VIDEO_FAMILIES, VideoSpec, catalog_get
 
 CallbackType = Optional[Callable[[int, int, object], None]]
 
@@ -67,6 +67,46 @@ class DeviceInfo:
     kind: str
     description: str
     generator_device: str
+
+
+@dataclass(slots=True)
+class VideoResult:
+    """A generated clip, still as frames. Encoding is a separate step
+    (`video_export.encode_video`) so the frames can also be inspected,
+    thumbnailed or re-encoded at a different quality without regenerating."""
+
+    frames: list
+    fps: int
+    width: int
+    height: int
+    seed: Optional[int] = None
+    model_id: str = ""
+
+    @property
+    def duration(self) -> float:
+        return len(self.frames) / float(self.fps or 1)
+
+
+def _round_video_dims(spec: VideoSpec, width: int, height: int) -> tuple[int, int]:
+    """Snap to the dimension multiple the model's VAE requires."""
+    m = max(1, spec.dim_multiple)
+    return (max(m, round(width / m) * m), max(m, round(height / m) * m))
+
+
+def _round_frame_count(spec: VideoSpec, num_frames: int) -> int:
+    """Snap to a legal frame count: `n % modulus == offset`, clamped to the
+    model's maximum. For LTX that is 8k+1 — 121 is legal, 120 is rejected.
+
+    Rounds to the NEAREST legal count, not down: flooring turns a request for
+    8 frames into 1, i.e. silently hands back a still image instead of a clip.
+    """
+    mod, off = max(1, spec.frame_modulus), spec.frame_offset
+    floor_n = int(num_frames) - ((int(num_frames) - off) % mod)
+    candidates = [c for c in (floor_n, floor_n + mod) if c >= max(off, 1)]
+    if not candidates:
+        candidates = [max(off, 1)]
+    best = min(candidates, key=lambda c: (abs(c - int(num_frames)), c))
+    return max(max(off, 1), min(best, spec.max_frames))
 
 
 class PipelineManager:
@@ -217,6 +257,13 @@ class PipelineManager:
                 cb_data,
             )[1]
 
+        # A video model loaded into the still-image path would otherwise fail
+        # deep inside the pipeline with an opaque shape error.
+        if self._current_family in VIDEO_FAMILIES:
+            raise RuntimeError(
+                f"{self._current_model_id} is a video model — call generate_video()."
+            )
+
         # SD3 / Flux: a single text2img path. compel, IP-Adapter,
         # reference-image blending and hires fix are SDXL-only in this build.
         if self._current_family in ("sd3", "flux"):
@@ -325,6 +372,101 @@ class PipelineManager:
                 generator=generator,
             )
         return base_image
+
+    def generate_video(
+        self,
+        *,
+        prompt: str,
+        negative_prompt: str = "",
+        width: int = 704,
+        height: int = 480,
+        num_frames: Optional[int] = None,
+        steps: int = 40,
+        guidance_scale: float = 3.0,
+        seed: Optional[int] = None,
+        progress_callback: CallbackType = None,
+    ) -> VideoResult:
+        """Generate a clip with a video-family pipeline (LTX).
+
+        Frame count and dimensions are rounded to what the model's 3D VAE
+        actually accepts (see VideoSpec) rather than passed through — an
+        illegal value is a hard pipeline error, and silently rejecting the
+        user's number is worse than snapping it to the nearest legal one.
+        """
+        with self._lock:
+            if self._pipeline is None:
+                raise RuntimeError("Pipeline not loaded")
+            if self._current_family not in VIDEO_FAMILIES:
+                raise RuntimeError(
+                    f"{self._current_model_id} is a {self._current_family} model, "
+                    "which makes still images — call generate_image() instead, or "
+                    "load a video model (e.g. Lightricks/LTX-Video)."
+                )
+            pipe = self._pipeline
+            model_id = self._current_model_id
+            generator_device = self._device_info.generator_device
+            device_kind = self._device_info.kind
+
+        torch = _lazy_import_torch()
+        spec = catalog_get(model_id).video or VideoSpec()
+
+        req_w, req_h, req_f = width, height, num_frames
+        width, height = _round_video_dims(spec, width, height)
+        frames_n = _round_frame_count(spec, num_frames if num_frames else spec.num_frames)
+        if (width, height) != (req_w, req_h):
+            self.logger.info(
+                "Rounded size %sx%s -> %sx%s (model needs multiples of %s)",
+                req_w, req_h, width, height, spec.dim_multiple,
+            )
+        if req_f and frames_n != req_f:
+            self.logger.info(
+                "Rounded frame count %s -> %s (model needs %sk+%s)",
+                req_f, frames_n, spec.frame_modulus, spec.frame_offset,
+            )
+
+        generator = None
+        if seed is not None:
+            gen_device = generator_device if device_kind in {"cuda", "cpu"} else "cpu"
+            generator = torch.Generator(device=gen_device).manual_seed(seed)
+
+        cb_kwargs = {}
+        if progress_callback is not None:
+            cb_kwargs["callback_on_step_end"] = lambda _pipe, step, _ts, cb_data: (
+                progress_callback(step, steps, None),
+                cb_data,
+            )[1]
+
+        self.logger.info(
+            "Generating video | model=%s | %sx%s | %s frames @ %s fps | steps=%s | guidance=%.2f",
+            model_id, width, height, frames_n, spec.fps, steps, guidance_scale,
+        )
+        try:
+            result = pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt or None,
+                width=width,
+                height=height,
+                num_frames=frames_n,
+                num_inference_steps=steps,
+                guidance_scale=guidance_scale,
+                generator=generator,
+                output_type="pil",
+                **cb_kwargs,
+            )
+        except Exception as exc:
+            self.logger.exception("Video generation failed: %s", exc)
+            raise RuntimeError(f"Video generation failed: {exc}") from exc
+
+        frames = list(result.frames[0])
+        self.logger.info("Generated %d frames", len(frames))
+        return VideoResult(
+            frames=frames,
+            fps=spec.fps,
+            width=width,
+            height=height,
+            seed=seed,
+            model_id=model_id or "",
+        )
 
     def upscale_image(self, base_image: Image.Image, prompt: str) -> Image.Image:
         """AI-upscale an image using the SD x4 upscaler pipeline."""
@@ -1014,7 +1156,11 @@ class PipelineManager:
             model_id, family, self._device_info.description,
         )
 
-        if family == "flux":
+        if family == "ltx":
+            if lora_config is not None:
+                self.logger.warning("LoRA is not applied to LTX video models in this build")
+            pipe = self._create_ltx_pipeline(model_id)
+        elif family == "flux":
             if lora_config is not None:
                 self.logger.warning("LoRA is not applied to Flux models in this build")
             pipe = self._create_flux_pipeline(model_id)
@@ -1178,6 +1324,52 @@ class PipelineManager:
                 pipe = pipe.to(self._device_info.generator_device)
             except Exception:
                 self.logger.warning("Flux: could not move pipeline to device")
+        self._apply_dit_optimizations(pipe)
+        return pipe
+
+    def _create_ltx_pipeline(self, model_id: str):
+        """Load LTX-Video. The 2B transformer is small (~4 GiB at bf16); the
+        T5-XXL text encoder is the problem (~9.5 GiB at bf16), so this uses
+        `enable_model_cpu_offload()` like the Flux path — the encoder is
+        resident only while encoding the prompt, then streamed back out before
+        the denoise loop. Peak stays well inside 16 GB."""
+        torch = _lazy_import_torch()
+        LTXPipeline, _ = _lazy_import_ltx_pipelines()
+
+        local_dir = self._model_dir_for_id(model_id)
+        local_dir.mkdir(parents=True, exist_ok=True)
+        load_kwargs = {
+            "cache_dir": str(local_dir),
+            "torch_dtype": torch.bfloat16,
+        }
+        if self._hf_token:
+            load_kwargs["token"] = self._hf_token
+
+        try:
+            pipe = LTXPipeline.from_pretrained(model_id, **load_kwargs)
+        except Exception as exc:
+            self.logger.exception("Failed to load LTX model %s: %s", model_id, exc)
+            raise RuntimeError(
+                f"Failed to load {model_id}. Fetch its diffusers weights first with "
+                f"`venv\\Scripts\\python.exe scripts\\fetch_ltx.py` (the repo root "
+                f"holds ~254 GB of checkpoint variants that must NOT be pulled). "
+                f"Error: {exc}"
+            ) from exc
+
+        try:
+            pipe.enable_model_cpu_offload()
+            self.logger.info("LTX: enabled model CPU offload")
+        except Exception as exc:
+            self.logger.warning("LTX: enable_model_cpu_offload failed: %s", exc)
+            try:
+                pipe = pipe.to(self._device_info.generator_device)
+            except Exception:
+                self.logger.warning("LTX: could not move pipeline to device")
+        # 🔴 VAE tiling is not optional here. Video latents are frames x H x W
+        # and the whole stack is decoded to pixels AFTER the last sampling
+        # step, so an untiled decode spikes past anything the denoise loop
+        # used and dies at the very end of an otherwise-successful run. Same
+        # failure shape as DECISIONS §22 rule A on the Betelgeuse iGPU.
         self._apply_dit_optimizations(pipe)
         return pipe
 
@@ -1392,6 +1584,17 @@ def _lazy_import_sd3_pipeline():
     except ImportError as exc:
         raise RuntimeError(
             "StableDiffusion3Pipeline not available — upgrade diffusers: %s" % exc
+        )
+
+
+def _lazy_import_ltx_pipelines():
+    """(LTXPipeline, LTXImageToVideoPipeline) — text2video and image2video."""
+    try:
+        from diffusers import LTXImageToVideoPipeline, LTXPipeline  # type: ignore
+        return LTXPipeline, LTXImageToVideoPipeline
+    except ImportError as exc:
+        raise RuntimeError(
+            "LTXPipeline not available — upgrade diffusers (needs >=0.32): %s" % exc
         )
 
 

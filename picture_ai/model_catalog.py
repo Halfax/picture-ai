@@ -10,6 +10,11 @@ are deliberately omitted.
     "sdxl" — StableDiffusionXL* pipelines (compel, IP-Adapter, LoRA, hires)
     "sd3"  — StableDiffusion3Pipeline      (text2img only)
     "flux" — FluxPipeline, NF4-quantized   (text2img only)
+    "ltx"  — LTXPipeline / LTXImageToVideoPipeline (text2video, image2video)
+
+A video family entry also carries a `video: VideoSpec`, which holds the
+constraints the model imposes on frame count and dimensions. Those are hard
+requirements of the model's 3D VAE, not style preferences — see VideoSpec.
 
 `single_file` marks an SDXL checkpoint distributed as one .safetensors file
 rather than a diffusers-format repo; the loader uses `from_single_file` for
@@ -39,10 +44,30 @@ class Recommended:
 
 
 @dataclass(frozen=True)
+class VideoSpec:
+    """Frame/dimension constraints for a video model, plus its defaults.
+
+    `frame_modulus` / `frame_offset` encode the model's legal frame counts as
+    `n % frame_modulus == frame_offset`. For LTX that is 8k+1 (8, 1): the 3D
+    VAE compresses 8 frames into one latent frame plus a leading keyframe, so
+    120 frames is rejected and 121 is not. `dim_multiple` is the same story for
+    width/height. These are model requirements — `pipeline_manager` rounds to
+    them rather than passing a value the pipeline will refuse.
+    """
+
+    num_frames: int = 97               # default length (~4 s at 24 fps)
+    fps: int = 24                      # default playback rate
+    frame_modulus: int = 8
+    frame_offset: int = 1
+    dim_multiple: int = 32
+    max_frames: int = 257
+
+
+@dataclass(frozen=True)
 class ModelInfo:
     repo_id: str
     label: str
-    family: str = "sdxl"               # sdxl | sd3 | flux
+    family: str = "sdxl"               # sdxl | sd3 | flux | ltx
     tag: str = "custom"
     blurb: str = ""
     # Heuristic base VRAM (GiB) for a 1024x1024 / 30-step gen; the VRAM
@@ -51,6 +76,17 @@ class ModelInfo:
     single_file: bool = False          # SDXL only: load via from_single_file
     gated: bool = False                # HF repo requires accepting a license
     recommended: Recommended = field(default_factory=Recommended)
+    # Present only on video families; None means "this model makes stills".
+    video: VideoSpec | None = None
+
+
+# Families that produce video rather than a still image.
+VIDEO_FAMILIES = frozenset({"ltx"})
+
+
+def is_video_model(repo_id: str) -> bool:
+    """True if `repo_id` resolves to a video family."""
+    return catalog_get(repo_id).family in VIDEO_FAMILIES
 
 
 # Shared recommendation for the plain SDXL finetunes.
@@ -167,6 +203,33 @@ MODEL_CATALOG: dict[str, ModelInfo] = {
             cfg_scale=3.5,
             sampler="Euler a",
             note="Flux dev: guidance ~3.5, 20-28 steps. 'CFG' here is Flux's distilled guidance — keep it low.",
+        ),
+    ),
+    # ---- LTX video family (LTXPipeline, text2video + image2video) ---------
+    # The repo carries every released checkpoint as a single .safetensors at
+    # its root (~254 GB in total); only the diffusers-format subfolders are
+    # fetched — see scripts/fetch_ltx.py.
+    "Lightricks/LTX-Video": ModelInfo(
+        repo_id="Lightricks/LTX-Video",
+        label="LTX-Video (text2video)",
+        family="ltx",
+        tag="video · fast · open weights",
+        blurb=(
+            "Generates short video clips. Loaded bf16 with CPU offload — the T5-XXL "
+            "text encoder is the memory hog, so it is streamed off the GPU after "
+            "encoding. 704x480 is its native-ish size; larger costs VRAM fast. "
+            "Prompts want camera and motion language, not just a subject."
+        ),
+        vram_base_gb=10.0,
+        video=VideoSpec(num_frames=97, fps=24),
+        recommended=Recommended(
+            steps=40,
+            cfg_scale=3.0,
+            sampler="Euler a",
+            note=(
+                "LTX: guidance 3.0-3.5, 30-50 steps, 24 fps. Flow-matching model — "
+                "the sampler picker doesn't apply. Describe motion and camera."
+            ),
         ),
     ),
     "black-forest-labs/FLUX.1-schnell": ModelInfo(
