@@ -4,6 +4,11 @@ config/hf_token.txt
 .env
 .env.local
 
+# Runtime user settings - holds the last-used prompt and seed. This repo is
+# pushed to a PUBLIC GitHub remote as well as GitLab, so tracking it published
+# whatever was last typed into the GUI. Defaults live in settings_store.py.
+config/settings.json
+
 # Python virtual environment
 venv/
 .venv/
