@@ -18,11 +18,31 @@ Code does not port verbatim between them. The `betelgeuse` branch's model
 registry *metadata* was ported into `main`'s `model_catalog.py`; its Vulkan
 backend, sd-server and q8_0 quantization were not (different substrate).
 
-## Headless / programmatic use (no GUI) — VERIFIED 2026-07-06, don't re-derive
+## Programmatic use — prefer `picture_ai.api` (added 2026-07-27)
 
-There is **no server/API** — but you don't need the Tkinter GUI to generate.
-Drive `PipelineManager` directly. This exact recipe was verified on UYScuti /
-RTX 5080 (Juggernaut-XL-v9, 768², 8 steps, generated in seconds):
+**`api.py` is now the supported entry point**, not raw `PipelineManager`. It
+owns model loading, family dispatch, legal frame counts and encoding, so a
+caller states intent and nothing else:
+
+```python
+from picture_ai import api
+img  = api.generate_image("a lantern in fog", steps=25)        # -> ImageResult
+clip = api.generate_video("a lantern swinging in fog", seconds=4)  # -> Clip
+clip.save("clip.mp4")          # NVENC h264/hevc/av1, libx264 fallback
+```
+
+Also `python -m picture_ai.cli {image,video,encode,models,doctor,serve}` and the
+HTTP job API (`serve`). All three are the same engine — `cli` and `server` are
+thin clients of `api`.
+
+⚠ **The older recipe below still works and is NOT deprecated** — several
+existing consumers use it (`arhutils/pictureai_*.py`, `ashes-of-grace/art/*.py`).
+`PipelineManager`'s signature is unchanged and backward compatible. Prefer
+`api` for anything new; there is no need to migrate working scripts.
+
+### The raw PipelineManager recipe — VERIFIED 2026-07-06, don't re-derive
+
+Verified on UYScuti / RTX 5080 (Juggernaut-XL-v9, 768², 8 steps, seconds):
 
 ```python
 import sys
@@ -72,6 +92,21 @@ venv\Scripts\python.exe scripts\your_script.py
   - **sd3** — `StableDiffusion3Pipeline`, fp16, text2img only.
   - **flux** — `FluxPipeline`, NF4-quantized (transformer + T5) via
     `PipelineQuantizationConfig`, `enable_model_cpu_offload()`, text2img.
+  - **ltx** — `LTXPipeline`, bf16 + `enable_model_cpu_offload()`, **video**.
+    Entered through `generate_video()`, NOT `generate_image()` (which raises
+    for a video family rather than failing deep in the pipeline). Frame counts
+    and dimensions are snapped to what the 3D VAE accepts (`VideoSpec`: 8k+1
+    frames, /32 dims for LTX) — rounding to the NEAREST legal value, because
+    flooring turns a request for 8 frames into 1, i.e. a still.
+    🔴 **VAE tiling is load-bearing here, not an optimization.** Video latents
+    are frames×H×W and the stack decodes to pixels *after* the final sampling
+    step, so without tiling a run completes every step and then dies at the
+    decode. Same failure shape as DECISIONS §22 rule A on Betelgeuse's iGPU,
+    different substrate.
+  - **Fetching LTX:** `scripts/fetch_ltx.py`. Do NOT `snapshot_download` the
+    whole repo — `Lightricks/LTX-Video` keeps every released checkpoint at its
+    root and totals **~254 GB**; only the diffusers subfolders (~28.5 GB) are
+    used by `from_pretrained`.
 - **All SDXL-only machinery is gated behind `self._current_family`.** The
   SDXL path is unchanged from before the multi-family work — if you touch
   `generate_image`, keep the `_current_family in ("sd3","flux")` early-out
@@ -95,9 +130,28 @@ venv\Scripts\python.exe scripts\your_script.py
 
 ## When editing this project
 
-- **No web framework, no server.** This is a local Tkinter app — there is
-  no trust boundary to reason about (unlike the `betelgeuse` branch / the
-  Halfax-AI API in DECISIONS §19). Don't add a server.
+- **There IS a server now — the old "don't add one" rule was overturned
+  2026-07-27, by Andrew, deliberately.** The previous rule read *"No web
+  framework, no server... Don't add a server."* Its reasoning was that a local
+  Tkinter app has no trust boundary to reason about. That reasoning was sound
+  for a GUI-only app and is now simply out of date: the app was **UI-only with
+  no callable surface**, so every other consumer — a script, another project,
+  another host on the fleet — had to reimplement model loading and family
+  rules by driving `PipelineManager` internals. The fix is `api.py` (the
+  library), `cli.py` (the shell), `server.py` (the network).
+  **This is a decision, not drift — don't "restore" the no-server rule.**
+- **The server is stdlib `http.server`, and that part is still a WON'T.**
+  🚫 **DELIBERATELY NOT DONE: no FastAPI / uvicorn / Flask dependency.** A
+  loopback job queue does not need a web framework, and this is a desktop app
+  whose dependency set is already heavy (torch, diffusers, transformers).
+  If you find yourself wanting FastAPI, the question to answer first is what
+  the framework buys that ~200 lines of `BaseHTTPRequestHandler` doesn't.
+- 🔴 **The HTTP API has NO authentication, and the default bind is loopback.**
+  On loopback the trust boundary is "processes on this box". Binding elsewhere
+  (`--host`) puts unauthenticated GPU-consuming, disk-writing endpoints on the
+  LAN/mesh, which is DECISIONS §19 territory and wants a firewall rule, not
+  just the flag. The flag exists because the fleet may want it; the loopback
+  default must not drift.
 - **SD3 / Flux are text2img-only here.** compel, IP-Adapter, reference
   images, HiRes Fix and LoRA are SDXL-only. If you extend SD3/Flux, add a
   family-appropriate path — do not route them through the SDXL helpers
@@ -131,6 +185,23 @@ venv\Scripts\python.exe scripts\your_script.py
   Console-script wrappers (`pip.exe`, ...) embed an absolute interpreter
   path and fail with "cannot find the file specified". `python -m pip`
   works; recreating the venv (`python -m venv venv`) is the clean fix.
+
+## Future / under consideration
+
+- **Video generation — SHIPPED 2026-07-27**, no longer speculative. LTX
+  text2video + NVENC encoding + UI + API/CLI/HTTP. `projects/VIDEO-IDEAS.md`
+  still holds the reasoning and the *engine-side* half (HalfaxForge cutscene
+  playback), which remains undecided.
+- **Video features not built** (CAN'T-yet, not WON'T — nobody has needed them):
+  image2video (`LTXImageToVideoPipeline` is already imported by
+  `_lazy_import_ltx_pipelines` and unused), video2video, the LTX latent
+  upscalers, and other video families (Wan, CogVideoX, HunyuanVideo). Adding a
+  family means a catalog entry with a `VideoSpec` plus a branch in
+  `_create_pipeline`; `generate_video()` itself is family-agnostic.
+- 🚫 **DELIBERATELY NOT DONE: no second video model was added "for coverage".**
+  Wan-1.3B would fit the 5080 easily, but an unverified catalog entry is worse
+  than none — it claims support nobody ran. Add one when it is going to be
+  used, and generate with it before committing the entry.
 
 ## Pointer back
 
