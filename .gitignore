@@ -20,6 +20,7 @@ build/
 dist/
 
 # Downloaded model weights (huge, regenerable from HF)
+models/
 models_cache/
 hf_cache/
 .cache/huggingface/
@@ -27,6 +28,7 @@ hf_cache/
 # Generated images and runtime caches
 image_cache/
 output/
+outputs/
 generated/
 
 # Logs
