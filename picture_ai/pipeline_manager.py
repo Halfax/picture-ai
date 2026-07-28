@@ -378,6 +378,45 @@ class PipelineManager:
             self.logger.warning("Failed to init compel: %s", exc)
             return None
 
+    @staticmethod
+    def _compel_padding(compel):
+        """Build the padding tensor compel's SDXL path can't build for itself.
+
+        `Compel.pad_conditioning_tensors_to_same_length` reads
+        `self.conditioning_provider.empty_z`. For SDXL the provider is an
+        `EmbeddingsProviderMulti` (two tokenizers / two text encoders), and
+        that class has no `empty_z` — only the single-encoder
+        `EmbeddingsProvider` does. So the call raises AttributeError, the
+        caller below falls back to the raw prompt, and CLIP silently truncates
+        at 77 tokens. That is why long prompts appeared to be ignored past the
+        first ~77 tokens even though compel is configured with
+        `truncate_long_prompts=False`.
+
+        It only fires when the positive and negative prompts land in a
+        *different* number of 77-token chunks — the function returns early when
+        all conditionings already share a shape — which is why short prompts
+        always worked and a long positive with a short negative did not.
+
+        The sub-providers each expose `empty_z`, and the multi-provider
+        concatenates along the embedding dim, so the tensor it wanted is just
+        their concatenation. Returns None if the layout isn't what we expect,
+        which restores the previous (truncating) behaviour rather than failing.
+        """
+        provider = getattr(compel, "conditioning_provider", None)
+        if provider is None or hasattr(provider, "empty_z"):
+            return None  # single-encoder path: compel handles it itself
+        subs = getattr(provider, "embedding_providers", None)
+        if not subs:
+            return None
+        try:
+            torch = _lazy_import_torch()
+            parts = [p.empty_z for p in subs]
+            if getattr(provider, "concat_along_embedding_dim", True):
+                return torch.cat(parts, dim=-1)
+            return parts[0]
+        except Exception:
+            return None
+
     def _encode_prompts(self, prompt: str, negative_prompt: str) -> dict | None:
         """Return prompt_embeds kwargs dict if compel is available, else None.
         Caller falls back to raw prompt= / negative_prompt= when None is
@@ -388,7 +427,9 @@ class PipelineManager:
         try:
             cond, pooled = compel(prompt)
             neg_cond, neg_pooled = compel(negative_prompt or "")
-            cond, neg_cond = compel.pad_conditioning_tensors_to_same_length([cond, neg_cond])
+            cond, neg_cond = compel.pad_conditioning_tensors_to_same_length(
+                [cond, neg_cond], precomputed_padding=self._compel_padding(compel)
+            )
             return {
                 "prompt_embeds": cond,
                 "pooled_prompt_embeds": pooled,
